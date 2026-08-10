@@ -1,0 +1,73 @@
+========================================
+LIVE DEPLOYMENT FILES LIST
+========================================
+Password Reset Token Expiration Functionality
+========================================
+
+FILES TO UPLOAD TO LIVE SERVER:
+
+1. NEW VIEW FILE:
+   - resources/views/auth/expired-token.blade.php
+   (This is a completely new file for expired token display)
+
+2. UPDATED CONTROLLER FILES:
+   - app/Http/Controllers/Admin/Auth/NewPasswordController.php
+   (Updated to show expired token view instead of redirect)
+
+   - app/Http/Controllers/Staff/Auth/NewPasswordController.php
+   (Updated to show expired token view instead of redirect)
+
+========================================
+DEPLOYMENT INSTRUCTIONS:
+========================================
+
+1. BACKUP EXISTING FILES:
+   - Backup the existing controller files before uploading
+   - Keep a copy of the current NewPasswordController files
+
+2. UPLOAD ORDER:
+   Step 1: Upload the new view file first
+   Step 2: Upload the updated controller files
+
+3. AFTER UPLOAD:
+   - Clear Laravel cache: php artisan cache:clear
+   - Clear view cache: php artisan view:clear
+   - Clear route cache: php artisan route:clear
+
+4. TESTING:
+   - Test admin password reset with expired token
+   - Test staff password reset with expired token
+   - Verify no redirect buttons appear
+   - Verify proper message display
+
+========================================
+WHAT CHANGES WERE MADE:
+========================================
+
+1. NEW FILE: expired-token.blade.php
+   - Clean, modern design
+   - Shows "Your token has expired, please request again" message
+   - No redirect buttons
+   - Helpful instructions for users
+
+2. CONTROLLER UPDATES:
+   - Admin NewPasswordController:
+     * custom_reset_password_page() method updated
+     * custom_reset_password_store() method updated
+   
+   - Staff NewPasswordController:
+     * custom_reset_password_page() method updated
+     * custom_reset_password_store() method updated
+
+3. BEHAVIOR CHANGE:
+   - Before: Redirect to password request page with error
+   - After: Show expired token page with message, no redirects
+
+========================================
+FILES SUMMARY:
+========================================
+Total Files: 3
+- 1 New View File
+- 2 Updated Controller Files
+
+All files are ready for live deployment.

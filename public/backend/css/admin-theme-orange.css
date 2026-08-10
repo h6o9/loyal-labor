@@ -1,0 +1,140 @@
+/* Loyal Labor admin theme — orange (#FE7701), no default Bootstrap blue */
+
+:root {
+    --loyal-primary: #FE7701;
+    --loyal-primary-dark: #e56a01;
+    --loyal-primary-light: #fff4eb;
+}
+
+.btn-primary,
+.btn-info,
+.btn-theme {
+    background-color: var(--loyal-primary) !important;
+    border-color: var(--loyal-primary) !important;
+    color: #fff !important;
+}
+
+.btn-primary:hover,
+.btn-primary:focus,
+.btn-primary:active,
+.btn-info:hover,
+.btn-info:focus,
+.btn-info:active,
+.btn-theme:hover,
+.btn-theme:focus,
+.btn-theme:active {
+    background-color: var(--loyal-primary-dark) !important;
+    border-color: var(--loyal-primary-dark) !important;
+    color: #fff !important;
+}
+
+.btn-outline-primary {
+    color: var(--loyal-primary) !important;
+    border-color: var(--loyal-primary) !important;
+}
+
+.btn-outline-primary:hover,
+.btn-outline-primary:focus {
+    background-color: var(--loyal-primary) !important;
+    color: #fff !important;
+}
+
+.text-primary,
+a.text-primary {
+    color: var(--loyal-primary) !important;
+}
+
+a.text-primary:hover {
+    color: var(--loyal-primary-dark) !important;
+}
+
+.badge-primary,
+.badge-info {
+    background-color: var(--loyal-primary) !important;
+}
+
+.card-primary .card-header {
+    background-color: var(--loyal-primary) !important;
+    color: #fff !important;
+}
+
+/* Primary badges/buttons stay orange; navbar + logo brand stay clean (no orange bar) */
+body .bg-primary {
+    background-color: var(--loyal-primary) !important;
+}
+
+.navbar-bg {
+    background-color: #ffffff !important;
+}
+
+.main-sidebar .sidebar-brand a {
+    background-color: transparent !important;
+}
+
+.page-item.active .page-link {
+    background-color: var(--loyal-primary) !important;
+    border-color: var(--loyal-primary) !important;
+}
+
+.page-link {
+    color: var(--loyal-primary) !important;
+}
+
+.spinner-border.text-primary,
+.loyal-theme-spinner {
+    color: var(--loyal-primary) !important;
+}
+
+.nav-pills .nav-link.active,
+.nav-pills .show > .nav-link {
+    background-color: var(--loyal-primary) !important;
+}
+
+.select2-container--default .select2-results__option--highlighted[aria-selected] {
+    background-color: var(--loyal-primary) !important;
+}
+
+.form-control:focus,
+.custom-select:focus {
+    border-color: var(--loyal-primary);
+    box-shadow: 0 0 0 0.2rem rgba(254, 119, 1, 0.2);
+}
+
+/* Password show/hide eye button (all admin/staff forms) */
+.password-input-wrap {
+    position: relative;
+    display: block;
+    width: 100%;
+}
+.password-input-wrap .form-control,
+.password-input-wrap .password-field-input {
+    padding-right: 2.85rem !important;
+}
+.password-toggle-btn {
+    position: absolute;
+    right: 2px;
+    top: 50%;
+    transform: translateY(-50%);
+    border: 0 !important;
+    background: transparent !important;
+    color: #6c757d !important;
+    padding: 0.4rem 0.75rem;
+    line-height: 1;
+    cursor: pointer;
+    z-index: 5;
+}
+.password-toggle-btn:hover,
+.password-toggle-btn:focus {
+    color: var(--loyal-primary) !important;
+    outline: none !important;
+}
+.password-toggle-btn i {
+    font-size: 1rem;
+    pointer-events: none;
+}
+
+
+.loyal-table-toolbar .loyal-search,
+.loyal-table-toolbar .loyal-per-page {
+    min-width: 120px;
+}

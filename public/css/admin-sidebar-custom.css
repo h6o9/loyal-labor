@@ -1,0 +1,121 @@
+/* Custom Admin Sidebar Styles for Loy Madok */
+
+/* Main menu structure */
+.sidebar-menu .nav-link {
+    padding: 12px 20px !important;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.sidebar-menu .nav-link i:first-child {
+    margin-right: 10px;
+    font-size: 16px;
+    width: 20px;
+    text-align: center;
+}
+
+.sidebar-menu .nav-link span {
+    font-weight: 500;
+    font-size: 14px;
+    flex: 1;
+}
+
+.sidebar-menu .nav-link i:last-child {
+    transition: transform 0.3s ease;
+    font-size: 12px;
+}
+
+/* Submenu styling */
+.sidebar-menu .submenu {
+    position: relative;
+}
+
+.sidebar-menu .submenu.open > .nav-link i:last-child {
+    transform: rotate(-90deg);
+}
+
+.sidebar-menu .submenu-nav {
+    display: none;
+    background-color: rgba(0, 0, 0, 0.05);
+    padding-left: 0;
+}
+
+.sidebar-menu .submenu.open .submenu-nav {
+    display: block;
+}
+
+.sidebar-menu .submenu-nav .nav-link {
+    padding: 10px 20px 10px 50px !important;
+    font-size: 13px;
+    color: #6c757d;
+}
+
+.sidebar-menu .submenu-nav .nav-link:hover {
+    color: #EB9620;
+    background-color: rgba(235, 150, 32, 0.1);
+}
+
+.sidebar-menu .submenu-nav .nav-link i {
+    margin-right: 8px;
+    font-size: 14px;
+    width: 16px;
+    text-align: center;
+}
+
+/* Menu headers */
+.menu-header {
+    padding: 15px 20px 8px 20px !important;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #6c757d;
+    background: linear-gradient(90deg, rgba(0,0,0,0.05) 0%, transparent 100%);
+    margin-top: 10px;
+}
+
+/* Active state styling */
+.sidebar-menu li.active > .nav-link {
+    background-color: rgba(235, 150, 32, 0.1) !important;
+    border-left: 3px solid #EB9620;
+    color: #EB9620 !important;
+}
+
+.sidebar-menu .submenu-nav li.active .nav-link {
+    border-left: none;
+    background-color: rgba(235, 150, 32, 0.15) !important;
+}
+
+/* Hover effects */
+.sidebar-menu .nav-link:hover {
+    background-color: rgba(0, 0, 0, 0.05);
+}
+
+/* Dashboard special case - no submenu */
+.sidebar-menu > li:not(.submenu) > .nav-link {
+    padding: 15px 20px !important;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+}
+
+.sidebar-menu > li:not(.submenu) > .nav-link i {
+    margin-right: 15px;
+    font-size: 18px;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .sidebar-menu .nav-link span {
+        font-size: 13px;
+    }
+    
+    .sidebar-menu .submenu-nav .nav-link {
+        padding: 8px 20px 8px 45px !important;
+        font-size: 12px;
+    }
+    
+    .menu-header {
+        padding: 10px 15px 5px 15px !important;
+        font-size: 11px;
+    }
+}

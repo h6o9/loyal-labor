@@ -1,0 +1,31 @@
+{
+    "name": "nwidart/frontend",
+    "description": "This is the frontend module.",
+    "authors": [
+        {
+            "name": "websolutionus",
+            "email": "websolutionus1@gmail.com"
+        }
+    ],
+    "extra": {
+        "laravel": {
+            "providers": [],
+            "aliases": {
+
+            }
+        }
+    },
+    "autoload": {
+        "psr-4": {
+            "Modules\\Frontend\\": "",
+            "Modules\\Frontend\\App\\": "app/",
+            "Modules\\Frontend\\Database\\Factories\\": "database/factories/",
+            "Modules\\Frontend\\Database\\Seeders\\": "database/seeders/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Modules\\Frontend\\Tests\\": "tests/"
+        }
+    }
+}

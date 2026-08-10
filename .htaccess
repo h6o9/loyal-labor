@@ -1,0 +1,31 @@
+<IfModule mod_rewrite.c>
+    <IfModule mod_negotiation.c>
+        Options -MultiViews
+    </IfModule>
+
+    RewriteEngine On
+    # Local XAMPP: /homeservices-12Mar2026/  |  Live server: /homeservices/
+    RewriteBase /homeservices-12Mar2026/
+
+    # Pass Authorization header to PHP
+    RewriteCond %{HTTP:Authorization} ^(.*)
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%1]
+
+    # Only skip rewriting for exactly /update or /update/
+    RewriteCond %{REQUEST_URI} ^/update/?$ [NC]
+    RewriteRule ^ - [L]
+
+    # Skip existing files and directories
+    RewriteCond %{REQUEST_FILENAME} -d [OR]
+    RewriteCond %{REQUEST_FILENAME} -f
+    RewriteRule ^ - [L]
+
+    # Send static file requests to /public/
+    RewriteCond %{REQUEST_URI} (\.\w+)$ [NC]
+    RewriteRule ^(.*)$ public/$1
+
+    # Everything else goes to Laravel's server.php
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^ server.php
+</IfModule>

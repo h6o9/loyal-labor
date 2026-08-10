@@ -1,0 +1,11 @@
+{
+    "name": "KnowYourClient",
+    "alias": "knowyourclient",
+    "description": "",
+    "keywords": [],
+    "priority": 0,
+    "providers": [
+        "Modules\\KnowYourClient\\app\\Providers\\KnowYourClientServiceProvider"
+    ],
+    "files": []
+}

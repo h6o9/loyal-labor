@@ -1,0 +1,39 @@
+/* Consistent spacing/look for server-side DataTables across Admin & Staff panels */
+.dataTables_wrapper {
+    padding: 0;
+}
+
+.dataTables_wrapper .dataTables_length,
+.dataTables_wrapper .dataTables_filter {
+    margin-bottom: 15px;
+}
+
+.dataTables_wrapper .dataTables_filter input {
+    display: inline-block;
+    width: auto;
+    margin-left: 8px;
+}
+
+.dataTables_wrapper .dataTables_length select {
+    display: inline-block;
+    width: auto;
+    margin: 0 6px;
+}
+
+.dataTables_wrapper .dataTables_info {
+    padding-top: 12px;
+}
+
+.dataTables_wrapper .dataTables_paginate {
+    margin-top: 10px;
+}
+
+table.dataTable thead th {
+    white-space: nowrap;
+}
+
+table.dataTable th:first-child,
+table.dataTable td:first-child {
+    width: 50px;
+    text-align: center;
+}

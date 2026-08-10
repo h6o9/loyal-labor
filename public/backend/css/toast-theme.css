@@ -1,0 +1,135 @@
+/* Theme-matched iziToast — solid colors, white text, fast animations (project-wide). */
+
+:root {
+    --toast-primary: #EB9620;
+    --toast-success: #47c363;
+    --toast-warning: #ffa426;
+    --toast-error: #fc544b;
+    --toast-info: #3abaf4;
+    --toast-radius: 12px;
+    --toast-shadow: 0 4px 15px rgba(235, 150, 32, 0.28);
+}
+
+/* Faster show/hide across the entire project */
+.iziToast-capsule {
+    transition: transform 0.25s cubic-bezier(0.25, 0.8, 0.25, 1),
+                height 0.25s cubic-bezier(0.25, 0.8, 0.25, 1) !important;
+}
+
+.iziToast .revealIn,
+.iziToast.revealIn,
+.iziToast .slideIn,
+.iziToast.slideIn {
+    animation-duration: 0.28s !important;
+}
+
+.iziToast.fadeIn,
+.iziToast .fadeIn,
+.iziToast.fadeInRight,
+.iziToast.fadeInLeft,
+.iziToast.fadeInUp,
+.iziToast.fadeInDown {
+    animation-duration: 0.22s !important;
+}
+
+.iziToast.fadeOut,
+.iziToast .fadeOut,
+.iziToast.fadeOutRight,
+.iziToast.fadeOutLeft,
+.iziToast.fadeOutUp,
+.iziToast.fadeOutDown {
+    animation-duration: 0.18s !important;
+}
+
+@media only screen and (min-width: 568px) {
+    .iziToast {
+        border-radius: var(--toast-radius) !important;
+        min-width: 280px;
+        max-width: 380px;
+        font-family: "Nunito", "Segoe UI", Tahoma, Arial, sans-serif;
+    }
+
+    .iziToast:after {
+        border-radius: var(--toast-radius) !important;
+        box-shadow: var(--toast-shadow) !important;
+    }
+}
+
+.iziToast.iziToast-layout2 .iziToast-body .iziToast-message,
+.iziToast.iziToast-layout2 .iziToast-body .iziToast-texts {
+    width: 100%;
+}
+
+.iziToast > .iziToast-body .iziToast-title {
+    font-weight: 700;
+    font-size: 14px;
+    line-height: 1.3;
+}
+
+.iziToast > .iziToast-body .iziToast-message {
+    font-size: 13px;
+    line-height: 1.4;
+    margin-bottom: 6px;
+}
+
+/* Theme colors */
+.iziToast.iziToast-color-green {
+    background-color: var(--toast-success) !important;
+    border-color: var(--toast-success) !important;
+}
+
+.iziToast.iziToast-color-red {
+    background-color: var(--toast-error) !important;
+    border-color: var(--toast-error) !important;
+}
+
+.iziToast.iziToast-color-yellow {
+    background-color: var(--toast-warning) !important;
+    border-color: var(--toast-warning) !important;
+}
+
+.iziToast.iziToast-color-blue {
+    background-color: var(--toast-info) !important;
+    border-color: var(--toast-info) !important;
+}
+
+/* Default / info toasts use primary theme orange */
+.iziToast:not(.iziToast-color-green):not(.iziToast-color-red):not(.iziToast-color-yellow):not(.iziToast-color-blue) {
+    background-color: var(--toast-primary) !important;
+    border-color: var(--toast-primary) !important;
+}
+
+.iziToast.iziToast-color-green .iziToast-title,
+.iziToast.iziToast-color-green .iziToast-message,
+.iziToast.iziToast-color-red .iziToast-title,
+.iziToast.iziToast-color-red .iziToast-message,
+.iziToast.iziToast-color-yellow .iziToast-title,
+.iziToast.iziToast-color-yellow .iziToast-message,
+.iziToast.iziToast-color-blue .iziToast-title,
+.iziToast.iziToast-color-blue .iziToast-message,
+.iziToast:not(.iziToast-color-green):not(.iziToast-color-red):not(.iziToast-color-yellow):not(.iziToast-color-blue) .iziToast-title,
+.iziToast:not(.iziToast-color-green):not(.iziToast-color-red):not(.iziToast-color-yellow):not(.iziToast-color-blue) .iziToast-message {
+    color: #fff !important;
+}
+
+.iziToast .iziToast-icon {
+    filter: brightness(0) invert(1);
+}
+
+.iziToast .iziToast-close {
+    filter: brightness(0) invert(1);
+    opacity: 0.85;
+}
+
+.iziToast .iziToast-close:hover {
+    opacity: 1;
+}
+
+.iziToast > .iziToast-progressbar {
+    background: rgba(255, 255, 255, 0.15) !important;
+}
+
+.iziToast > .iziToast-progressbar > div {
+    background: rgba(255, 255, 255, 0.75) !important;
+    height: 3px !important;
+}
