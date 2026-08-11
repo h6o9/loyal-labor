@@ -6,15 +6,24 @@ use Illuminate\Support\Facades\Broadcast;
 |--------------------------------------------------------------------------
 | Broadcast Channels
 |--------------------------------------------------------------------------
-|
-| Here you may register all of the event broadcasting channels that your
-| application supports. The given channel authorization callbacks are
-| used to check if an authenticated user can listen to the channel.
-|
 */
 
 Broadcast::channel('App.Models.User.{id}', function ($user, $id) {
     return (int) $user->id === (int) $id;
+});
+
+Broadcast::channel('technician.{id}', function ($user, $id) {
+    return $user->user_type === 'technician' && (int) $user->id === (int) $id;
+});
+
+Broadcast::channel('service-category.{categoryId}', function ($user, $categoryId) {
+    if ($user->user_type !== 'technician') {
+        return false;
+    }
+
+    return $user->serviceCategories()
+        ->where('service_categories.id', (int) $categoryId)
+        ->exists();
 });
 
 Broadcast::channel('livechat.{id}', function ($user, $id) {

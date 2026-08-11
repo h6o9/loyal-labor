@@ -8,10 +8,12 @@ use App\Models\District;         // ✅ Yeh bhi add karein (agar use kar rahe ha
 use App\Models\ServiceCategory;  // ✅ Yeh import add karein
 use App\Support\BookingReference;
 use App\Traits\GlobalMailTrait;
+use App\Events\BroadcastServiceRequestCreated;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Schema;
 
 class BookingController extends Controller
 {
@@ -268,7 +270,7 @@ class BookingController extends Controller
             ->update(['status' => 'expired']);
     }
 
-    private function matchingTechniciansQuery(int $serviceCategoryId, ?int $districtId = null)
+    private function matchingTechniciansQuery(int $serviceCategoryId, ?int $districtId = null, bool $onlineOnly = false)
     {
         $query = User::query()
             ->where('user_type', 'technician')
@@ -280,6 +282,10 @@ class BookingController extends Controller
 
         if ($districtId) {
             $query->where('district_id', $districtId);
+        }
+
+        if ($onlineOnly && Schema::hasColumn('users', 'currently_available')) {
+            $query->where('currently_available', true);
         }
 
         return $query;
@@ -330,10 +336,7 @@ class BookingController extends Controller
     $customer = $request->user();
     $expiryMinutes = $this->bookingExpiryMinutes();
     $now = Carbon::now();
-
-    // Fetch service category and district names
-    $serviceCategory = ServiceCategory::find($request->service_category_id);
-    $district = $request->district_id ? District::find($request->district_id) : null;
+    $requestId = BookingReference::generateBroadcast($request->emergency_level);
 
     $booking = Booking::create([
         'customer_id' => $customer->id,
@@ -350,30 +353,49 @@ class BookingController extends Controller
         'city' => $request->city,
         'phone' => $request->phone ?? $customer->phone,
         'additional_notes' => $request->additional_notes,
-        'booking_reference' => null,
+        'booking_reference' => $requestId,
         'expires_at' => $now->copy()->addMinutes($expiryMinutes),
     ]);
 
-    $techniciansNotified = $this->matchingTechniciansQuery(
+    $onlineTechnicians = $this->matchingTechniciansQuery(
         (int) $request->service_category_id,
-        $request->district_id ? (int) $request->district_id : null
-    )->count();
+        $request->district_id ? (int) $request->district_id : null,
+        true
+    )->get(['id', 'name', 'currently_available']);
 
-    // Load relationships
+    $technicianIds = $onlineTechnicians->pluck('id')->map(fn ($id) => (int) $id)->values()->all();
+
+    $pusherDispatched = false;
+    try {
+        event(new BroadcastServiceRequestCreated($booking->fresh(['serviceCategory', 'district', 'customer']), $technicianIds));
+        $pusherDispatched = true;
+    } catch (\Throwable $e) {
+        // Keep broadcast API working even when Pusher keys are not configured yet.
+        // #region agent log
+        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'featured-broadcast', 'hypothesisId' => 'H-PUSHER', 'location' => 'BookingController::broadcastRequest', 'message' => 'pusher dispatch failed', 'data' => ['error' => $e->getMessage(), 'request_id' => $requestId], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+    }
+
+    // #region agent log
+    @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'featured-broadcast', 'hypothesisId' => 'H-BCAST', 'location' => 'BookingController::broadcastRequest', 'message' => 'broadcast created', 'data' => ['booking_id' => $booking->id, 'request_id' => $requestId, 'online_technicians' => count($technicianIds), 'pusher_dispatched' => $pusherDispatched], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+    // #endregion
+
     $booking->load(['serviceCategory', 'district']);
 
     return response()->json([
         'success' => true,
         'message' => 'Your request has been broadcast to available technicians.',
+        'request_id' => $requestId,
         'booking' => [
             'id' => $booking->id,
+            'request_id' => $requestId,
             'customer_id' => $booking->customer_id,
             'technician_id' => $booking->technician_id,
             'booking_type' => $booking->booking_type,
-            'service_category' => $booking->serviceCategory ? $booking->serviceCategory->name : null, // ✅ Name instead of ID
-            'service_category_id' => $booking->service_category_id, // ✅ Keeping ID as well (optional)
-            'district' => $booking->district ? $booking->district->name : null, // ✅ Name instead of ID
-            'district_id' => $booking->district_id, // ✅ Keeping ID as well (optional)
+            'service_category' => $booking->serviceCategory ? $booking->serviceCategory->name : null,
+            'service_category_id' => $booking->service_category_id,
+            'district' => $booking->district ? $booking->district->name : null,
+            'district_id' => $booking->district_id,
             'emergency_level' => $booking->emergency_level,
             'status' => $booking->status,
             'service_date' => $booking->service_date,
@@ -388,7 +410,20 @@ class BookingController extends Controller
             'created_at' => $booking->created_at,
             'updated_at' => $booking->updated_at,
         ],
-        'technicians_notified' => $techniciansNotified,
+        'technicians_notified' => count($technicianIds),
+        'notified_technicians' => $onlineTechnicians->map(fn ($tech) => [
+            'id' => $tech->id,
+            'name' => $tech->name,
+        ])->values(),
+        'pusher' => [
+            'dispatched' => $pusherDispatched,
+            'event' => 'broadcast.request.created',
+            'channels' => [
+                'private-service-category.' . (int) $booking->service_category_id,
+                'private-technician.{id} for each online matching technician',
+            ],
+            'note' => 'Add PUSHER_* keys in .env and set BROADCAST_DRIVER=pusher when ready.',
+        ],
         'expires_at' => $booking->expires_at,
         'expires_in_minutes' => $expiryMinutes,
     ], 201);
@@ -416,12 +451,14 @@ class BookingController extends Controller
 
         $techniciansNotified = $this->matchingTechniciansQuery(
             (int) $booking->service_category_id,
-            $booking->district_id ? (int) $booking->district_id : null
+            $booking->district_id ? (int) $booking->district_id : null,
+            true
         )->count();
 
         $response = [
             'success' => true,
             'booking_id' => $booking->id,
+            'request_id' => $booking->booking_reference,
             'status' => $booking->status,
             'expires_at' => $booking->expires_at,
             'technicians_notified' => $techniciansNotified,
@@ -442,6 +479,7 @@ class BookingController extends Controller
             $response['message'] = 'A technician accepted your request.';
             $response['technician'] = $booking->technician;
             $response['booking_reference'] = $booking->booking_reference;
+            $response['request_id'] = $booking->booking_reference;
         } elseif ($booking->status === 'cancelled') {
             $response['message'] = 'You cancelled this request.';
         }

@@ -8,7 +8,18 @@ class BookingReference
 {
     public static function generate(): string
     {
-        $prefix = 'FXT';
+        return self::generateWithPrefix('FXT');
+    }
+
+    public static function generateBroadcast(?string $emergencyLevel = null): string
+    {
+        $prefix = $emergencyLevel === 'emergency' ? 'EMG' : 'REQ';
+
+        return self::generateWithPrefix($prefix);
+    }
+
+    private static function generateWithPrefix(string $prefix): string
+    {
         $year = date('Y');
 
         do {

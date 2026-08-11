@@ -158,15 +158,12 @@ class TechnicianController extends Controller
             ],
             'account_status' => $user->status,
             'payment_status' => $user->payment_status ?? 'none',
-            'subscription_active' => $user->subscription == 'active' && ($user->subscription_end > now()),
+            'subscription_active' => $user->hasActiveSubscription(),
             'subscription_end' => $user->subscription_end,
-            'subscription_plan' => $user->subscriptionPlan ? [
-                'id' => $user->subscriptionPlan->id,
-                'name' => $user->subscriptionPlan->name,
-                'permissions' => is_array($user->subscriptionPlan->features)
-                    ? $user->subscriptionPlan->features
-                    : explode(',', $user->subscriptionPlan->features ?? ''),
-            ] : null,
+            'is_featured' => $user->isFeaturedTechnician(),
+            'has_verified_badge' => $user->hasVerifiedPlanBadge(),
+            'feature_keys' => $user->activeFeatureKeys(),
+            'subscription_plan' => $user->subscriptionPlan ? $user->subscriptionPlan->toApiArray() : null,
             'availability' => $user->availabilities,
             'currently_available' => Schema::hasColumn('users', 'currently_available')
                 ? (bool) ($user->currently_available ?? true)
@@ -281,8 +278,8 @@ class TechnicianController extends Controller
     public function getTechnicians(Request $request)
     {
         $request->validate([
-            'filter' => 'nullable|in:all,top_rated,nearest',
-            'sort_by' => 'nullable|in:rating,distance,name',
+            'filter' => 'nullable|in:all,top_rated,nearest,featured',
+            'sort_by' => 'nullable|in:rating,distance,name,featured',
             'service_category_id' => 'nullable|integer|exists:service_categories,id',
             'category' => 'nullable',
             'latitude' => 'nullable|numeric|between:-90,90',
@@ -351,7 +348,7 @@ class TechnicianController extends Controller
             $query->where('users.district_id', $request->district_id);
         }
 
-        $technicians = $query->with(['serviceCategories', 'availabilities'])->get();
+        $technicians = $query->with(['serviceCategories', 'availabilities', 'subscriptionPlan'])->get();
 
         $ratingBreakdowns = [];
         if (Schema::hasTable('technician_reviews') && $technicians->isNotEmpty()) {
@@ -394,6 +391,11 @@ class TechnicianController extends Controller
                 ? (bool) ($tech->currently_available ?? true)
                 : true;
 
+            $featureKeys = $tech->activeFeatureKeys();
+            $isFeatured = $tech->isFeaturedTechnician();
+            $hasVerifiedBadge = $tech->hasVerifiedPlanBadge();
+            $plan = $tech->subscriptionPlan;
+
             return [
                 'id' => $tech->id,
                 'name' => $tech->name,
@@ -414,8 +416,25 @@ class TechnicianController extends Controller
                 'distance_text' => $distanceKm !== null ? $distanceKm . ' km away' : null,
                 'currently_available' => $currentlyAvailable,
                 'availability_status' => $this->resolveAvailabilityStatus($currentlyAvailable),
+                'is_featured' => $isFeatured,
+                'featured_badge' => $isFeatured ? 'FEATURED' : null,
+                'has_verified_badge' => $hasVerifiedBadge,
+                'subscription' => [
+                    'plan_type' => $plan->plan_type ?? null,
+                    'plan_type_label' => $plan?->plan_type_label,
+                    'is_active' => $tech->hasActiveSubscription(),
+                    'feature_keys' => $featureKeys,
+                ],
             ];
         });
+
+        // #region agent log
+        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'featured-broadcast', 'hypothesisId' => 'H-FEAT', 'location' => 'TechnicianController::getTechnicians', 'message' => 'featured flags computed', 'data' => ['total' => $mapped->count(), 'featured_count' => $mapped->where('is_featured', true)->count(), 'filter' => $filter, 'sample' => $mapped->take(3)->map(fn ($t) => ['id' => $t['id'], 'is_featured' => $t['is_featured'], 'plan' => $t['subscription']['plan_type'] ?? null])->values()], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
+        if ($filter === 'featured') {
+            $mapped = $mapped->filter(fn ($t) => $t['is_featured'])->values();
+        }
 
         if ($filter === 'top_rated') {
             $mapped = $mapped->filter(fn ($t) => $t['review_count'] > 0)
@@ -484,14 +503,29 @@ class TechnicianController extends Controller
             $mapped = $mapped->sortBy(fn ($t) => $t['distance_km'] ?? 999999)->values();
         } elseif ($sortBy === 'name') {
             $mapped = $mapped->sortBy('name')->values();
+        } elseif ($sortBy === 'featured' || (!$sortBy && in_array($filter, ['all', 'featured'], true))) {
+            // Featured / priority search plans float to the top for home + search lists.
+            $mapped = $mapped->sort(function ($a, $b) {
+                $aPriority = ($a['is_featured'] ? 2 : 0)
+                    + (in_array('priority_search_placement', $a['subscription']['feature_keys'] ?? [], true) ? 1 : 0);
+                $bPriority = ($b['is_featured'] ? 2 : 0)
+                    + (in_array('priority_search_placement', $b['subscription']['feature_keys'] ?? [], true) ? 1 : 0);
+
+                if ($aPriority === $bPriority) {
+                    return $b['rating'] <=> $a['rating'];
+                }
+
+                return $bPriority <=> $aPriority;
+            })->values();
         }
 
         $categoryFilter = $request->input('service_category_id') ?? $request->input('category', 'all');
+        $featuredList = $mapped->filter(fn ($t) => $t['is_featured'])->values();
 
         return response()->json([
             'success' => 200,
             'filter' => $filter,
-            'sort_by' => $sortBy ?? 'default',
+            'sort_by' => $sortBy ?? 'featured',
             'service_category_id' => $categoryFilter,
             'google_maps' => [
                 'customer_latitude' => $customerLat,
@@ -500,6 +534,8 @@ class TechnicianController extends Controller
                 'integration_status' => 'structure_ready',
                 'distance_note' => 'distance_km is null until customer lat/lng and technician coordinates are set',
             ],
+            'featured_total' => $featuredList->count(),
+            'featured' => $featuredList,
             'total' => $mapped->count(),
             'data' => $mapped,
         ]);

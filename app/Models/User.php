@@ -256,6 +256,52 @@ class User extends Authenticatable
         return $this->belongsTo(Subscription::class, 'subscription_id');
     }
 
+    public function hasActiveSubscription(): bool
+    {
+        if (($this->subscription ?? null) !== 'active' || !$this->subscription_id) {
+            return false;
+        }
+
+        if ($this->subscription_end && now()->toDateString() > (string) $this->subscription_end) {
+            return false;
+        }
+
+        return true;
+    }
+
+    public function activeFeatureKeys(): array
+    {
+        if (!$this->hasActiveSubscription()) {
+            return [];
+        }
+
+        $plan = $this->relationLoaded('subscriptionPlan')
+            ? $this->subscriptionPlan
+            : $this->subscriptionPlan()->first();
+
+        if (!$plan) {
+            return [];
+        }
+
+        return Subscription::featureKeysForPlanType($plan->plan_type ?? 'basic_plan');
+    }
+
+    public function hasPlanFeature(string $featureKey): bool
+    {
+        return in_array($featureKey, $this->activeFeatureKeys(), true);
+    }
+
+    public function isFeaturedTechnician(): bool
+    {
+        return $this->hasPlanFeature('profile_featured');
+    }
+
+    public function hasVerifiedPlanBadge(): bool
+    {
+        return $this->hasPlanFeature('verified_badge')
+            || $this->hasPlanFeature('verified_technician_badge');
+    }
+
     public function referralShop()
     {
         return $this->belongsTo(Shop::class, 'referral_shop_id');
