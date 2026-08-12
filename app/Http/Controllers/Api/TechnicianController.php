@@ -275,6 +275,33 @@ class TechnicianController extends Controller
         ]);
     }
 
+	public function checkTechnicianAvailability(Request $request)
+{
+    $request->validate([
+        'technician_id' => 'required|integer|exists:users,id',
+    ]);
+
+    $technician = User::where('id', $request->technician_id)
+        ->where('user_type', 'technician')
+        ->first();
+
+    if (!$technician) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Technician not found.',
+        ], 404);
+    }
+
+    $isAvailable = (bool) $technician->currently_available;
+
+    return response()->json([
+        'success' => true,
+        'technician_id' => $technician->id,
+        'currently_available' => $isAvailable,
+        'availability_status' => $isAvailable ? 'Available' : 'Busy',
+    ]);
+}
+
     public function getTechnicians(Request $request)
     {
         $request->validate([

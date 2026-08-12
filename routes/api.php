@@ -71,6 +71,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/technician/availability', [TechnicianController::class, 'updateAvailability']);
     Route::post('/technician/availability/toggle', [TechnicianController::class, 'toggleDayAvailability']);
     Route::post('/technician/currently-available', [TechnicianController::class, 'toggleCurrentlyAvailable']);
+	Route::get('/technician/availability', [TechnicianController::class, 'checkTechnicianAvailability']);
     Route::post('/technician/work-gallery', [TechnicianController::class, 'uploadWorkGallery']);
     Route::get('/technician/work-gallery', [TechnicianController::class, 'myWorkGallery']);
     Route::delete('/technician/work-gallery/{galleryId}', [TechnicianController::class, 'deleteWorkGallery']);
