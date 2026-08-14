@@ -74,6 +74,16 @@ class SidebarMenuHelper
                     'setting.update' => 'Update Settings',
                     'permission.view' => 'View Permissions'
                 ]
+            ],
+            'system_records' => [
+                'title' => 'System Records',
+                'icon' => 'fas fa-cogs',
+                'permissions' => [
+                    'service.categories.view' => 'View Service Categories',
+                    'service.categories.create' => 'Create Service Category',
+                    'service.categories.edit' => 'Edit / Active-Inactive Service Category',
+                    'service.categories.delete' => 'Delete Service Category',
+                ]
             ]
         ];
     }

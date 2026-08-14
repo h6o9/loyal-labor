@@ -53,22 +53,70 @@ class BookingController extends Controller
         ]);
     }
 
-    private function formatBookingStatusLabel(string $status): string
+    private function normalizeBookingStatus($status): string
     {
+        $value = strtolower(trim((string) $status));
+
+        return $value === '' ? 'pending' : $value;
+    }
+
+    private function formatBookingStatusLabel($status): string
+    {
+        $status = $this->normalizeBookingStatus($status);
+
         return match ($status) {
-            'pending' => 'Pending',
-            'accepted' => 'Upcoming',
-            'on_the_way' => 'On the Way',
-            'work_started' => 'Work Started',
+            'pending', 'accepted', 'on_the_way', 'work_started' => 'Upcoming',
             'completed' => 'Completed',
-            'cancelled' => 'Cancelled',
-            'rejected' => 'Rejected',
+            'cancelled', 'rejected' => 'Cancelled',
             'expired' => 'Expired',
             default => ucfirst(str_replace('_', ' ', $status)),
         };
     }
 
-    private function formatTimeSlot12h(?string $timeSlot): ?string
+    private function resolveBookingsFilter(Request $request): string
+    {
+        $raw = $request->input('filters')
+            ?? $request->input('filter')
+            ?? $request->input('status')
+            ?? $request->input('tab')
+            ?? 'all';
+
+        $filter = strtolower(trim((string) $raw));
+
+        return match ($filter) {
+            'upcoming', 'pending' => 'upcoming',
+            'completed' => 'completed',
+            'cancelled', 'canceled' => 'cancelled',
+            'expired' => 'expired',
+            default => 'all',
+        };
+    }
+
+    private function bookingFilterStatuses(string $filter): ?array
+    {
+        return match ($filter) {
+            'upcoming' => ['pending', 'accepted', 'on_the_way', 'work_started'],
+            'completed' => ['completed'],
+            'cancelled' => ['cancelled', 'rejected'],
+            'expired' => ['expired'],
+            default => null,
+        };
+    }
+
+    private function formatTimeSlotValue($timeSlot): ?string
+    {
+        if (!$timeSlot) {
+            return null;
+        }
+
+        try {
+            return Carbon::parse($timeSlot)->format('H:i');
+        } catch (\Throwable $e) {
+            return is_string($timeSlot) ? $timeSlot : null;
+        }
+    }
+
+    private function formatTimeSlot12h($timeSlot): ?string
     {
         if (!$timeSlot) {
             return null;
@@ -77,7 +125,7 @@ class BookingController extends Controller
         try {
             return Carbon::parse($timeSlot)->format('g:i A');
         } catch (\Throwable $e) {
-            return $timeSlot;
+            return is_string($timeSlot) ? $timeSlot : null;
         }
     }
 
@@ -181,20 +229,22 @@ class BookingController extends Controller
         $dateParts = $this->formatServiceDateParts($booking->service_date);
         $timeFormatted = $this->formatTimeSlot12h($booking->time_slot);
         $location = trim(($booking->address ?? '') . ($booking->city ? ', ' . $booking->city : ''), ', ');
+        $status = $this->normalizeBookingStatus($booking->status);
+        $statusLabel = $this->formatBookingStatusLabel($status);
 
         return [
             'id' => $booking->id,
             'booking_reference' => $booking->booking_reference,
             'booking_type' => $booking->booking_type,
-            'status' => $booking->status,
-            'status_label' => $this->formatBookingStatusLabel($booking->status),
+            'status' => $status,
+            'status_label' => $statusLabel,
             'technician' => $this->formatTechnicianSummary($booking->technician),
             'service_category' => $this->resolveBookingServiceCategory($booking),
             'service_details' => $booking->service_details,
             'service_date' => $dateParts['date'],
             'service_day' => $dateParts['day'],
             'service_date_formatted' => $dateParts['date_formatted'],
-            'time_slot' => $booking->time_slot,
+            'time_slot' => $this->formatTimeSlotValue($booking->time_slot),
             'time_formatted' => $timeFormatted,
             'date_time_formatted' => ($dateParts['date_formatted'] && $timeFormatted)
                 ? $dateParts['date_formatted'] . ' • ' . $timeFormatted
@@ -204,6 +254,10 @@ class BookingController extends Controller
             'location' => $location ?: null,
             'payment_status' => $booking->payment_status,
             'created_at' => $booking->created_at?->toIso8601String(),
+            'can_cancel' => in_array($status, ['pending', 'accepted'], true),
+            'can_rate' => $status === 'completed',
+            'can_rebook' => $status === 'completed',
+            'can_track' => in_array($status, ['accepted', 'on_the_way', 'work_started'], true),
         ];
     }
 
@@ -1005,27 +1059,50 @@ private function transformAcceptedBooking($booking)
         $customer = $request->user();
 
         $this->expirePendingBookingsQuery(
-        Booking::where('customer_id', $customer->id)
+            Booking::where('customer_id', $customer->id)
         );
 
-        $status = $request->get('status', 'all');
-        
-        $bookings = Booking::where('customer_id', $customer->id)
-            ->when($status !== 'all', function ($query) use ($status) {
-                return $query->where('status', $status);
+        Booking::where('customer_id', $customer->id)
+            ->where(function ($query) {
+                $query->whereNull('status')->orWhere('status', '');
+            })
+            ->update(['status' => 'pending']);
+
+        $filter = $this->resolveBookingsFilter($request);
+        $filterStatuses = $this->bookingFilterStatuses($filter);
+
+        $baseQuery = Booking::where('customer_id', $customer->id);
+
+        $filterCounts = [
+            'all' => (clone $baseQuery)->count(),
+            'upcoming' => (clone $baseQuery)->whereIn('status', ['pending', 'accepted', 'on_the_way', 'work_started'])->count(),
+            'completed' => (clone $baseQuery)->where('status', 'completed')->count(),
+            'cancelled' => (clone $baseQuery)->whereIn('status', ['cancelled', 'rejected'])->count(),
+        ];
+
+        $bookingsQuery = Booking::where('customer_id', $customer->id)
+            ->when($filterStatuses !== null, function ($query) use ($filterStatuses) {
+                return $query->whereIn('status', $filterStatuses);
             })
             ->with(['technician.serviceCategories', 'serviceCategory', 'district'])
-            ->orderBy('created_at', 'desc')
+            ->orderBy('created_at', 'desc');
+
+        // #region agent log
+        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'booking-filters', 'hypothesisId' => 'H-FILTER-PARAM', 'location' => 'BookingController::myBookings', 'message' => 'filter applied', 'data' => ['raw_filters' => $request->input('filters'), 'raw_filter' => $request->input('filter'), 'raw_status' => $request->input('status'), 'resolved' => $filter, 'filter_statuses' => $filterStatuses], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
+        $bookings = $bookingsQuery
             ->paginate(20)
-            ->through(function ($booking) {
+            ->appends($request->query())
+            ->through(function ($booking) use ($filter) {
                 $card = $this->formatBookingCardForCustomer($booking);
 
-                if ($booking->status === 'expired' && $booking->isBroadcast()) {
+                if ($card['status'] === 'expired' && $booking->isBroadcast()) {
                     $card['status_message'] = 'Your request is expired. Please broadcast a new request.';
                 }
 
                 // #region agent log
-                @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H2', 'location' => 'BookingController::myBookings', 'message' => 'booking card formatted', 'data' => ['booking_id' => $booking->id, 'status' => $booking->status, 'status_label' => $card['status_label'], 'has_technician_summary' => $card['technician'] !== null], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+                @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'booking-filters', 'hypothesisId' => 'H-FILTER-PARAM', 'location' => 'BookingController::myBookings', 'message' => 'booking card formatted', 'data' => ['filter' => $filter, 'booking_id' => $booking->id, 'status' => $card['status'], 'status_label' => $card['status_label']], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
                 // #endregion
 
                 return $card;
@@ -1033,10 +1110,12 @@ private function transformAcceptedBooking($booking)
 
         return response()->json([
             'success' => true,
-            'message' => $status === 'expired'
+            'message' => $filter === 'expired'
                 ? 'Your request is expired. Please broadcast a new request.'
                 : null,
             'response_format' => 'booking_cards_v1',
+            'filter' => $filter,
+            'filters' => $filterCounts,
             'total_bookings' => $bookings->total(),
             'data' => $bookings,
         ]);
@@ -1220,6 +1299,156 @@ private function transformAcceptedBooking($booking)
             'message' => 'Booking status updated to ' . str_replace('_', ' ', $request->status)
         ]);
     }
+    // Customer/Technician: Booking Status screen (track live progress)
+    public function getBookingStatus(Request $request, $bookingId)
+    {
+        $user = $request->user();
+
+        $bookingQuery = Booking::query()->where(function ($query) use ($user) {
+            $query->where('customer_id', $user->id)
+                ->orWhere('technician_id', $user->id);
+        });
+
+        $booking = $bookingQuery->where(function ($query) use ($bookingId) {
+                $query->where('id', $bookingId)
+                    ->orWhere('booking_reference', $bookingId)
+                    ->orWhere('booking_reference', ltrim((string) $bookingId, '#'));
+            })
+            ->with([
+                'customer',
+                'technician.serviceCategories',
+                'technician.subscriptionPlan',
+                'serviceCategory',
+                'district',
+            ])
+            ->first();
+
+        if (!$booking) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Booking not found.',
+            ], 404);
+        }
+
+        if ($booking->status === 'pending' && $booking->expires_at && Carbon::now()->greaterThan($booking->expires_at)) {
+            $booking->update(['status' => 'expired']);
+            $booking->refresh();
+        }
+
+        $technician = $booking->technician;
+        $avgRating = 0.0;
+        if ($technician) {
+            $avgRating = round((float) ($technician->approvedTechnicianReviews()->avg('rating') ?? 0), 1);
+        }
+
+        $serviceCategory = $this->resolveBookingServiceCategory($booking);
+        $timeline = $this->buildServiceProgressTimeline($booking);
+        $currentStep = collect($timeline)->firstWhere('is_current', true);
+        $canCancel = in_array($booking->status, ['pending', 'accepted'], true);
+
+        $arrivalMessage = null;
+        if ($technician && in_array($booking->status, ['accepted', 'on_the_way'], true)) {
+            $arrivalMessage = 'You will be notified when ' . $technician->name . ' arrives at your location.';
+        }
+
+        // #region agent log
+        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'booking-status', 'hypothesisId' => 'H-STATUS', 'location' => 'BookingController::getBookingStatus', 'message' => 'booking status payload built', 'data' => ['booking_id' => $booking->id, 'status' => $booking->status, 'has_technician' => $technician !== null], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
+        return response()->json([
+            'success' => true,
+            'screen' => 'booking_status',
+            'data' => [
+                'id' => $booking->id,
+                'booking_id' => $booking->id,
+                'booking_reference' => $booking->booking_reference,
+                'request_id' => $booking->booking_reference,
+                'status' => $booking->status,
+                'status_label' => $this->formatBookingStatusLabel($booking->status),
+                'current_step' => $currentStep['title'] ?? null,
+                'is_live' => in_array($booking->status, ['accepted', 'on_the_way', 'work_started'], true),
+                'technician' => $technician ? [
+                    'id' => $technician->id,
+                    'name' => $technician->name,
+                    'initials' => $this->getPersonInitials($technician->name),
+                    'photo' => $technician->photo ? asset($technician->photo) : null,
+                    'phone' => $technician->phone,
+                    'profession' => $serviceCategory['name'] ?? null,
+                    'service_category' => $serviceCategory,
+                    'rating' => $avgRating,
+                    'is_verified' => $technician->hasVerifiedPlanBadge() || (bool) $technician->is_verified,
+                    'is_online' => (bool) ($technician->currently_available ?? false),
+                    'currently_available' => (bool) ($technician->currently_available ?? false),
+                ] : null,
+                'contact' => [
+                    'can_call' => !empty($technician?->phone),
+                    'can_chat' => $technician !== null,
+                    'phone' => $technician?->phone,
+                ],
+                'service_details' => $booking->service_details,
+                'address' => $booking->address,
+                'city' => $booking->city,
+                'service_progress' => $timeline,
+                'arrival_message' => $arrivalMessage,
+                'cancellation_allowed' => $canCancel,
+                'cancel_endpoint' => $canCancel ? '/api/bookings/' . $booking->id . '/cancel' : null,
+            ],
+        ]);
+    }
+
+    private function buildServiceProgressTimeline(Booking $booking): array
+    {
+        $technicianName = $booking->technician->name ?? 'Technician';
+
+        return [
+            [
+                'key' => 'request_sent',
+                'title' => 'Request Sent',
+                'status' => 'Done',
+                'time' => $booking->created_at ? $booking->created_at->format('h:i A') : null,
+                'description' => null,
+                'is_active' => in_array($booking->status, ['pending', 'accepted', 'on_the_way', 'work_started', 'completed'], true),
+                'is_current' => $booking->status === 'pending',
+            ],
+            [
+                'key' => 'accepted',
+                'title' => 'Technician Accepted',
+                'status' => $booking->accepted_at ? 'Done' : 'Pending',
+                'time' => $booking->accepted_at ? Carbon::parse($booking->accepted_at)->format('h:i A') : null,
+                'description' => $booking->accepted_at ? $technicianName . ' accepted your request' : null,
+                'is_active' => in_array($booking->status, ['accepted', 'on_the_way', 'work_started', 'completed'], true),
+                'is_current' => $booking->status === 'accepted',
+            ],
+            [
+                'key' => 'on_the_way',
+                'title' => 'On the Way',
+                'status' => $booking->on_the_way_at ? 'Done' : ($booking->status === 'accepted' ? 'In Progress' : 'Pending'),
+                'time' => $booking->on_the_way_at ? Carbon::parse($booking->on_the_way_at)->format('h:i A') : null,
+                'description' => $booking->status === 'accepted' && !$booking->on_the_way_at ? 'Waiting for technician to start travel' : null,
+                'is_active' => in_array($booking->status, ['on_the_way', 'work_started', 'completed'], true),
+                'is_current' => $booking->status === 'on_the_way',
+            ],
+            [
+                'key' => 'work_started',
+                'title' => 'Work Started',
+                'status' => $booking->work_started_at ? 'Done' : ($booking->status === 'on_the_way' ? 'In Progress' : 'Pending'),
+                'time' => $booking->work_started_at ? Carbon::parse($booking->work_started_at)->format('h:i A') : null,
+                'description' => $booking->work_started_at ? null : 'Pending technician arrival',
+                'is_active' => in_array($booking->status, ['work_started', 'completed'], true),
+                'is_current' => $booking->status === 'work_started',
+            ],
+            [
+                'key' => 'completed',
+                'title' => 'Completed',
+                'status' => $booking->completed_at || $booking->status === 'completed' ? 'Done' : 'Pending',
+                'time' => $booking->completed_at ? Carbon::parse($booking->completed_at)->format('h:i A') : null,
+                'description' => ($booking->completed_at || $booking->status === 'completed') ? null : 'Service completion pending',
+                'is_active' => $booking->status === 'completed',
+                'is_current' => $booking->status === 'completed',
+            ],
+        ];
+    }
+
     // Customer: Get single booking details
     public function getBookingDetails(Request $request, $bookingId)
     {
@@ -1256,49 +1485,7 @@ private function transformAcceptedBooking($booking)
             $booking->refresh();
         }
 
-        // Generate service progress timeline
-        $timeline = [
-            [
-                'title' => 'Request Sent',
-                'status' => 'Done',
-                'time' => $booking->created_at ? $booking->created_at->format('h:i A') : null,
-                'description' => null,
-                'is_active' => in_array($booking->status, ['pending', 'accepted', 'on_the_way', 'work_started', 'completed']),
-                'is_current' => $booking->status == 'pending'
-            ],
-            [
-                'title' => 'Technician Accepted',
-                'status' => $booking->accepted_at ? 'Done' : 'Pending',
-                'time' => $booking->accepted_at ? \Carbon\Carbon::parse($booking->accepted_at)->format('h:i A') : null,
-                'description' => $booking->accepted_at ? $booking->technician->name . ' accepted your request' : null,
-                'is_active' => in_array($booking->status, ['accepted', 'on_the_way', 'work_started', 'completed']),
-                'is_current' => $booking->status == 'accepted'
-            ],
-            [
-                'title' => 'On the Way',
-                'status' => $booking->on_the_way_at ? 'Done' : ($booking->status == 'accepted' ? 'In Progress' : 'Pending'),
-                'time' => $booking->on_the_way_at ? \Carbon\Carbon::parse($booking->on_the_way_at)->format('h:i A') : null,
-                'description' => null,
-                'is_active' => in_array($booking->status, ['on_the_way', 'work_started', 'completed']),
-                'is_current' => $booking->status == 'on_the_way'
-            ],
-            [
-                'title' => 'Work Started',
-                'status' => $booking->work_started_at ? 'Done' : ($booking->status == 'on_the_way' ? 'In Progress' : 'Pending'),
-                'time' => $booking->work_started_at ? \Carbon\Carbon::parse($booking->work_started_at)->format('h:i A') : null,
-                'description' => $booking->work_started_at ? null : 'Pending technician arrival',
-                'is_active' => in_array($booking->status, ['work_started', 'completed']),
-                'is_current' => $booking->status == 'work_started'
-            ],
-            [
-                'title' => 'Completed',
-                'status' => $booking->completed_at ? 'Done' : ($booking->status == 'work_started' ? 'In Progress' : 'Pending'),
-                'time' => $booking->completed_at ? \Carbon\Carbon::parse($booking->completed_at)->format('h:i A') : null,
-                'description' => $booking->completed_at ? null : 'Service completion pending',
-                'is_active' => $booking->status == 'completed',
-                'is_current' => $booking->status == 'completed'
-            ]
-        ];
+        $timeline = $this->buildServiceProgressTimeline($booking);
 
         return response()->json([
             'success' => true,

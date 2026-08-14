@@ -30,6 +30,7 @@
                                     <thead>
                                         <tr>
                                             <th>{{ __('SN') }}</th>
+                                            <th>{{ __('Icon') }}</th>
                                             <th>{{ __('Name') }}</th>
                                             <th>{{ __('Slug') }}</th>
                                             <th>{{ __('Sort Order') }}</th>
@@ -73,6 +74,7 @@
 
         $(document).ready(function() {
             initServerDataTable('#serviceCategoryTable', "{{ route('admin.service-categories.index') }}", [
+                { data: 'icon_html', name: 'icon', orderable: false, searchable: false },
                 { data: 'name', name: 'name' },
                 { data: 'slug', name: 'slug' },
                 { data: 'sort_order', name: 'sort_order' },

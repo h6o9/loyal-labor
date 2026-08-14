@@ -20,7 +20,7 @@
                 <div class="col-12">
                     <div class="card">
                         <div class="card-body">
-                            <form action="{{ route('admin.service-categories.store') }}" method="POST">
+                            <form action="{{ route('admin.service-categories.store') }}" method="POST" enctype="multipart/form-data">
                                 @csrf
                                 <div class="row">
                                     <div class="form-group col-12 col-md-6">
@@ -36,9 +36,10 @@
                                     </div>
 
                                     <div class="form-group col-12 col-md-6">
-                                        <label>{{ __('Icon') }}</label>
-                                        <input type="text" class="form-control" name="icon" value="{{ old('icon') }}" placeholder="e.g. fa-bolt or icon path">
-                                        @error('icon') <small class="text-danger">{{ $message }}</small> @enderror
+                                        <label>{{ __('Icon') }} <span class="text-danger">*</span></label>
+                                        <input type="file" class="form-control" name="icon_file" accept="image/*" required>
+                                        <small class="text-muted">{{ __('Upload PNG/JPG/SVG icon. This icon is shown in the app.') }}</small>
+                                        @error('icon_file') <small class="text-danger">{{ $message }}</small> @enderror
                                     </div>
 
                                     <div class="form-group col-12 col-md-3">

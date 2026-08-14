@@ -15,6 +15,22 @@ class ServiceCategory extends Model
         'sort_order' => 'integer',
     ];
 
+    public function iconUrl(): ?string
+    {
+        $icon = (string) ($this->icon ?? '');
+        if ($icon === '') {
+            return null;
+        }
+        if (str_starts_with($icon, 'http://') || str_starts_with($icon, 'https://')) {
+            return $icon;
+        }
+        if (str_starts_with($icon, 'fa-')) {
+            return null;
+        }
+
+        return asset($icon);
+    }
+
     public function technicians()
     {
         return $this->belongsToMany(

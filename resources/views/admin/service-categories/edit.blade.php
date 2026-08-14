@@ -20,7 +20,7 @@
                 <div class="col-12">
                     <div class="card">
                         <div class="card-body">
-                            <form action="{{ route('admin.service-categories.update', $serviceCategory->id) }}" method="POST">
+                            <form action="{{ route('admin.service-categories.update', $serviceCategory->id) }}" method="POST" enctype="multipart/form-data">
                                 @csrf
                                 @method('PUT')
                                 <div class="row">
@@ -38,8 +38,14 @@
 
                                     <div class="form-group col-12 col-md-6">
                                         <label>{{ __('Icon') }}</label>
-                                        <input type="text" class="form-control" name="icon" value="{{ old('icon', $serviceCategory->icon) }}">
-                                        @error('icon') <small class="text-danger">{{ $message }}</small> @enderror
+                                        @if($serviceCategory->iconUrl())
+                                            <div class="mb-2">
+                                                <img src="{{ $serviceCategory->iconUrl() }}" alt="{{ $serviceCategory->name }}" style="width:72px;height:72px;object-fit:contain;border-radius:12px;background:#f8f9fc;padding:6px;border:1px solid #e3e6f0;">
+                                            </div>
+                                        @endif
+                                        <input type="file" class="form-control" name="icon_file" accept="image/*">
+                                        <small class="text-muted">{{ __('Leave empty to keep current icon.') }}</small>
+                                        @error('icon_file') <small class="text-danger">{{ $message }}</small> @enderror
                                     </div>
 
                                     <div class="form-group col-12 col-md-3">

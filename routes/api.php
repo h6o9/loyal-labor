@@ -83,6 +83,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/bookings/my', [BookingController::class, 'myBookings']);
     Route::get('/bookings/requests', [BookingController::class, 'getBookingRequests']);
     Route::get('/bookings/{bookingId}/confirmation', [BookingController::class, 'getBookingConfirmation']);
+    Route::get('/bookings/{bookingId}/status', [BookingController::class, 'getBookingStatus']);
     Route::get('/bookings/{bookingId}', [BookingController::class, 'getBookingDetails']);
     Route::post('/bookings/{bookingId}/accept', [BookingController::class, 'acceptBooking']);
     Route::post('/bookings/{bookingId}/reject', [BookingController::class, 'rejectBooking']);

@@ -840,14 +840,35 @@ class TechnicianController extends Controller
 public function getServiceCategory()
 {
     try {
-        $data = ServiceCategory::select('id', 'name')->get();
+        $data = ServiceCategory::query()
+            ->where('is_active', true)
+            ->orderBy('sort_order')
+            ->orderBy('name')
+            ->get(['id', 'name', 'slug', 'icon', 'sort_order'])
+            ->map(function ($category) {
+                $iconUrl = $category->iconUrl();
+
+                return [
+                    'id' => $category->id,
+                    'name' => $category->name,
+                    'slug' => $category->slug,
+                    'icon' => $iconUrl,
+                    'icon_url' => $iconUrl,
+                    'sort_order' => (int) $category->sort_order,
+                ];
+            })
+            ->values();
+
+        // #region agent log
+        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H4', 'location' => 'TechnicianController::getServiceCategory', 'message' => 'api active categories only', 'data' => ['total' => $data->count(), 'inactive_skipped' => ServiceCategory::where('is_active', false)->count(), 'sample' => $data->take(2)->values()], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
 
         return response()->json([
             'success' => true,
             'message' => 'Service categories retrieved successfully.',
+            'total' => $data->count(),
             'data' => $data,
         ], 200);
-
     } catch (\Exception $e) {
         return response()->json([
             'success' => false,
