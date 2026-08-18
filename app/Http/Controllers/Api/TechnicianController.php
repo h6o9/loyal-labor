@@ -707,6 +707,12 @@ class TechnicianController extends Controller
             'caption' => $item->caption,
         ])->values();
 
+        $galleryTotal = $galleryItems->count();
+
+        // #region agent log
+        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H3', 'location' => 'TechnicianController::getTechnicianProfile', 'message' => 'profile work gallery', 'data' => ['technician_id' => $technician->id, 'total' => $galleryTotal, 'sample' => $galleryItems->take(2)->values()], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
         return response()->json([
             'success' => true,
             'data' => [
@@ -738,7 +744,8 @@ class TechnicianController extends Controller
                     'is_available' => (bool) $slot->is_available,
                 ])->values(),
                 'work_gallery' => [
-                    'total' => $galleryItems->count(),
+                    'total' => $galleryTotal,
+                    'remaining' => max(0, $galleryTotal - 3),
                     'items' => $galleryItems,
                 ],
             ],

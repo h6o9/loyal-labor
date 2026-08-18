@@ -120,6 +120,21 @@ class User extends Authenticatable
         return $this->hasMany(Address::class);
     }
 
+    public function savedAddresses(): HasMany
+    {
+        return $this->hasMany(UserSavedAddress::class);
+    }
+
+    public function memberSince(): ?string
+    {
+        return $this->created_at ? $this->created_at->format('F Y') : null;
+    }
+
+    public function memberSinceFrom(): ?string
+    {
+        return $this->created_at ? $this->created_at->toDateString() : null;
+    }
+
     /**
      * @return mixed
      */

@@ -557,7 +557,13 @@ class BookingController extends Controller
         }
 
         // Check if technician is available on that date/time
-        if (!$this->isTechnicianAvailable($technician->id, $request->service_date, $request->time_slot)) {
+        if (!$this->isTechnicianAvailable(
+            $technician->id,
+            $request->service_date,
+            $request->time_slot,
+            $request->emergency_level,
+            $technician
+        )) {
             return response()->json(['error' => 'Technician not available at this time'], 400);
         }
 
@@ -1504,8 +1510,15 @@ private function transformAcceptedBooking($booking)
     }
 
     // Helper: Check technician availability
-    private function isTechnicianAvailable($technicianId, $date, $timeSlot)
+    private function isTechnicianAvailable($technicianId, $date, $timeSlot, $emergencyLevel = null, $technician = null)
     {
+        $debug = [
+            'technician_id' => $technicianId,
+            'date' => $date,
+            'time_slot' => $timeSlot,
+            'emergency_level' => $emergencyLevel,
+        ];
+
         // Check if technician has any accepted booking at that time
         $conflictingBooking = Booking::where('technician_id', $technicianId)
             ->where('service_date', $date)
@@ -1514,26 +1527,95 @@ private function transformAcceptedBooking($booking)
             ->exists();
 
         if ($conflictingBooking) {
+            $debug['reason'] = 'conflicting_booking';
+            // #region agent log
+            @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H1', 'location' => 'BookingController::isTechnicianAvailable', 'message' => 'availability rejected', 'data' => $debug, 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+            // #endregion
             return false;
         }
 
-        // Check if day is within technician's working hours
-        $day = strtolower(date('l', strtotime($date)));
-        
+        try {
+            $parsedDate = Carbon::parse($date);
+        } catch (\Throwable $e) {
+            $debug['reason'] = 'invalid_date';
+            $debug['error'] = $e->getMessage();
+            // #region agent log
+            @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H2', 'location' => 'BookingController::isTechnicianAvailable', 'message' => 'availability rejected', 'data' => $debug, 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+            // #endregion
+            return false;
+        }
+
+        $day = strtolower($parsedDate->format('l'));
+        $debug['day'] = $day;
+
         $availability = DB::table('technician_availability')
             ->where('technician_id', $technicianId)
             ->where('day', $day)
             ->where('is_available', true)
+            ->whereNull('specific_date')
             ->first();
 
         if (!$availability) {
+            $debug['reason'] = 'no_weekly_schedule';
+            // #region agent log
+            @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H3', 'location' => 'BookingController::isTechnicianAvailable', 'message' => 'availability rejected', 'data' => $debug, 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+            // #endregion
             return false;
         }
 
-        // Check if time slot is within working hours
-        $requestTime = date('H:i:s', strtotime($timeSlot));
-        
-        return $requestTime >= $availability->start_time && $requestTime <= $availability->end_time;
+        $debug['start_time'] = $availability->start_time;
+        $debug['end_time'] = $availability->end_time;
+
+        $emergency = strtolower(trim((string) $emergencyLevel));
+        $isImmediateRequest = in_array($emergency, ['now', 'immediate', 'emergency'], true);
+        $isCurrentlyOnline = $technician
+            && Schema::hasColumn('users', 'currently_available')
+            && (bool) ($technician->currently_available ?? false);
+
+        $debug['is_immediate_request'] = $isImmediateRequest;
+        $debug['currently_available'] = $isCurrentlyOnline;
+
+        if ($isImmediateRequest && $isCurrentlyOnline) {
+            $debug['reason'] = 'immediate_online_ok';
+            // #region agent log
+            @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H5', 'location' => 'BookingController::isTechnicianAvailable', 'message' => 'availability accepted', 'data' => $debug, 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+            // #endregion
+            return true;
+        }
+
+        if (empty($availability->start_time) || empty($availability->end_time)) {
+            $debug['reason'] = 'open_day_no_hours';
+            // #region agent log
+            @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H4', 'location' => 'BookingController::isTechnicianAvailable', 'message' => 'availability accepted', 'data' => $debug, 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+            // #endregion
+            return true;
+        }
+
+        try {
+            $requestSeconds = Carbon::parse($timeSlot)->secondsSinceMidnight();
+            $startSeconds = Carbon::parse($availability->start_time)->secondsSinceMidnight();
+            $endSeconds = Carbon::parse($availability->end_time)->secondsSinceMidnight();
+        } catch (\Throwable $e) {
+            $debug['reason'] = 'invalid_time_slot';
+            $debug['error'] = $e->getMessage();
+            // #region agent log
+            @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H4', 'location' => 'BookingController::isTechnicianAvailable', 'message' => 'availability rejected', 'data' => $debug, 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+            // #endregion
+            return false;
+        }
+
+        $withinHours = $requestSeconds >= $startSeconds && $requestSeconds <= $endSeconds;
+        $debug['request_seconds'] = $requestSeconds;
+        $debug['start_seconds'] = $startSeconds;
+        $debug['end_seconds'] = $endSeconds;
+        $debug['within_hours'] = $withinHours;
+        $debug['reason'] = $withinHours ? 'within_working_hours' : 'outside_working_hours';
+
+        // #region agent log
+        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H4', 'location' => 'BookingController::isTechnicianAvailable', 'message' => $withinHours ? 'availability accepted' : 'availability rejected', 'data' => $debug, 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
+        return $withinHours;
     }
 
     // Helper: Notify technician (simplified - you can add real notifications)

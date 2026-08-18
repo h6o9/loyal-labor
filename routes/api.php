@@ -58,6 +58,12 @@ Route::post('/register-resend-otp', [AuthController::class, 'registerresendOtp']
 Route::middleware('auth:sanctum')->group(function () {
     Route::get('/profile', [AuthController::class, 'profile']);
     Route::post('/profile/update', [AuthController::class, 'updateProfile']);
+    Route::get('/addresses', [\App\Http\Controllers\Api\SavedAddressController::class, 'index']);
+    Route::post('/addresses', [\App\Http\Controllers\Api\SavedAddressController::class, 'store']);
+    Route::post('/addresses/{id}', [\App\Http\Controllers\Api\SavedAddressController::class, 'update']);
+    Route::put('/addresses/{id}', [\App\Http\Controllers\Api\SavedAddressController::class, 'update']);
+    Route::delete('/addresses/{id}', [\App\Http\Controllers\Api\SavedAddressController::class, 'destroy']);
+    Route::post('/addresses/{id}/default', [\App\Http\Controllers\Api\SavedAddressController::class, 'makeDefault']);
     Route::post('/logout', [AuthController::class, 'logout']);
 
     // Help & Support

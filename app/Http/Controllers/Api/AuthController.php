@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Booking;
 use App\Models\TechnicianAvailability;
+use App\Models\TechnicianWorkGallery;
 use App\Models\User;
 use App\Traits\GlobalMailTrait;
 use Illuminate\Http\Request;
@@ -73,6 +74,10 @@ public function register(Request $request)
             // ✅ Service categories (many-to-many). Technician ke liye required.
             'category_ids' => 'required_if:user_type,technician|array',
             'category_ids.*' => 'integer|exists:service_categories,id',
+            'work_gallery' => 'nullable|array|max:20',
+            'work_gallery.*' => 'file|mimes:jpg,jpeg,png,webp|max:5120',
+            'work_gallery_captions' => 'nullable|array',
+            'work_gallery_captions.*' => 'nullable|string|max:255',
             // ❌ REMOVED: 'subscription_id' => 'nullable|exists:subscriptions,id',
             'shop_reference_code' => 'nullable|string|exists:shops,reference_code',
         ];
@@ -227,11 +232,20 @@ public function register(Request $request)
             ? array_values(array_unique(array_map('intval', (array) $request->input('category_ids', []))))
             : [];
 
+        $workGalleryItems = $request->user_type == 'technician'
+            ? $this->storeWorkGalleryUploads($request)
+            : [];
+
+        // #region agent log
+        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H1', 'location' => 'AuthController::register', 'message' => 'register work gallery files', 'data' => ['user_type' => $request->user_type, 'has_work_gallery' => $request->hasFile('work_gallery'), 'saved_count' => count($workGalleryItems)], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
         // ✅ Store in cache (NOT in database)
         Cache::put(self::PENDING_REGISTRATION_PREFIX . strtolower($request->email), [
             'user_data' => $userData,
             'availability' => $availabilityData,
             'category_ids' => $categoryIds,
+            'work_gallery' => $workGalleryItems,
         ], now()->addMinutes(30));
         
         \Log::info('Pending registration cached (not saved to users table)', ['email' => $request->email]);
@@ -249,6 +263,12 @@ public function register(Request $request)
         // ✅ Prepare response with ALL request data + OTP
         $responseUser = collect($userData)->except(['password'])->toArray(); // ✅ OTP included in response
         $responseUser['category_ids'] = $categoryIds;
+        $responseUser['work_gallery'] = collect($workGalleryItems)->map(function ($item) {
+            return [
+                'image' => asset($item['image']),
+                'caption' => $item['caption'] ?? null,
+            ];
+        })->values();
         
         // ✅ Add availability to response
         $responseUser['availabilities'] = collect($availabilityData)->map(function ($schedule) {
@@ -515,6 +535,27 @@ public function registerresendOtp(Request $request)
             \Log::info('Availability created for technician', ['technician_id' => $user->id]);
         }
 
+        $savedGallery = [];
+        if ($user->user_type == 'technician' && !empty($pending['work_gallery'])) {
+            foreach ($pending['work_gallery'] as $index => $item) {
+                $gallery = TechnicianWorkGallery::create([
+                    'technician_id' => $user->id,
+                    'image' => $item['image'],
+                    'caption' => $item['caption'] ?? null,
+                    'sort_order' => $index + 1,
+                ]);
+                $savedGallery[] = [
+                    'id' => $gallery->id,
+                    'image' => asset($gallery->image),
+                    'caption' => $gallery->caption,
+                ];
+            }
+        }
+
+        // #region agent log
+        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H2', 'location' => 'AuthController::registerVerifyOtp', 'message' => 'work gallery persisted', 'data' => ['user_id' => $user->id, 'cached_count' => count($pending['work_gallery'] ?? []), 'saved_count' => count($savedGallery)], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
         // ✅ Clear cache after successful registration
         Cache::forget($cacheKey);
 
@@ -534,6 +575,7 @@ public function registerresendOtp(Request $request)
                     'specific_date' => $availability->specific_date,
                 ];
             });
+            $responseUser['work_gallery'] = $savedGallery;
         }
 
         // ✅ Generate authentication token
@@ -619,8 +661,26 @@ public function profile(Request $request)
                 'phone' => $user->phone,
                 'company' => $user->company ?? 'N/A',
                 'position' => $user->position ?? ($user->user_type === 'technician' ? $user->bio : 'Customer'),
+                'member_since' => $user->memberSince(),
+                'member_since_from' => $user->memberSinceFrom(),
             ],
         ];
+
+        $response['member_since'] = $user->memberSince();
+        $response['member_since_from'] = $user->memberSinceFrom();
+        $response['verified_label'] = $user->is_verified
+            ? ($user->user_type === 'technician' ? 'Verified Technician' : 'Verified Customer')
+            : null;
+
+        $savedAddresses = SavedAddressController::listForUser((int) $user->id);
+        $response['saved_addresses'] = [
+            'total' => $savedAddresses->count(),
+            'items' => $savedAddresses,
+        ];
+
+        // #region agent log
+        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H1', 'location' => 'AuthController::profile', 'message' => 'profile member since + addresses', 'data' => ['user_id' => $user->id, 'created_at' => optional($user->created_at)->toDateTimeString(), 'member_since' => $response['member_since'], 'member_since_from' => $response['member_since_from'], 'saved_addresses_total' => $savedAddresses->count()], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
 
         // =============================================
         // TECHNICIAN
@@ -715,10 +775,11 @@ public function profile(Request $request)
                 ->count();
 
             $response['stats'] = [
-                'total_bookings' => $bookingStats->total ?? 0,
-                'completed' => $bookingStats->completed ?? 0,
-                'pending' => $bookingStats->pending ?? 0,
+                'total_bookings' => (int) ($bookingStats->total ?? 0),
+                'completed' => (int) ($bookingStats->completed ?? 0),
+                'pending' => (int) ($bookingStats->pending ?? 0),
                 'reviews' => $reviewsCount,
+                'reviews_given' => $reviewsCount,
             ];
 
             $response['recent_bookings'] = DB::table('bookings')
@@ -899,11 +960,73 @@ public function profile(Request $request)
         }
 
         $user->update($data);
+        $user = $user->fresh();
+        $savedAddresses = SavedAddressController::listForUser((int) $user->id);
+
+        // #region agent log
+        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H1', 'location' => 'AuthController::updateProfile', 'message' => 'update profile member since', 'data' => ['user_id' => $user->id, 'member_since' => $user->memberSince(), 'member_since_from' => $user->memberSinceFrom()], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
 
         return response()->json([
             'success' => true,
             'message' => 'Profile updated successfully',
-            'user' => $user->fresh()
+            'user' => [
+                'id' => $user->id,
+                'user_type' => $user->user_type,
+                'name' => $user->name,
+                'email' => $user->email,
+                'phone' => $user->phone,
+                'photo' => $user->photo ? asset($user->photo) : null,
+                'bio' => $user->bio,
+                'experience' => $user->experience,
+                'member_since' => $user->memberSince(),
+                'member_since_from' => $user->memberSinceFrom(),
+                'personal_info' => [
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'phone' => $user->phone,
+                    'member_since' => $user->memberSince(),
+                    'member_since_from' => $user->memberSinceFrom(),
+                ],
+                'saved_addresses' => [
+                    'total' => $savedAddresses->count(),
+                    'items' => $savedAddresses,
+                ],
+            ],
         ]);
+    }
+
+    private function storeWorkGalleryUploads(Request $request): array
+    {
+        if (!$request->hasFile('work_gallery')) {
+            return [];
+        }
+
+        $files = $request->file('work_gallery');
+        if (!is_array($files)) {
+            $files = [$files];
+        }
+
+        $captions = (array) $request->input('work_gallery_captions', []);
+        $directory = public_path('backend/img/gallery');
+        if (!is_dir($directory)) {
+            mkdir($directory, 0755, true);
+        }
+
+        $items = [];
+        foreach ($files as $index => $file) {
+            if (!$file || !$file->isValid()) {
+                continue;
+            }
+
+            $filename = 'work_reg_' . time() . '_' . uniqid() . '.' . $file->getClientOriginalExtension();
+            $file->move($directory, $filename);
+            $items[] = [
+                'image' => 'backend/img/gallery/' . $filename,
+                'caption' => isset($captions[$index]) ? (string) $captions[$index] : null,
+            ];
+        }
+
+        return $items;
     }
 }
