@@ -7,6 +7,7 @@ use App\Models\Booking;
 use App\Models\TechnicianAvailability;
 use App\Models\TechnicianWorkGallery;
 use App\Models\User;
+use App\Models\UserSavedAddress;
 use App\Traits\GlobalMailTrait;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -58,7 +59,7 @@ public function register(Request $request)
         $rules = [
             'user_type' => 'required|in:customer,technician',
             'name' => 'required',
-            'email' => 'required|email|unique:users', // ✅ Email unique check
+            'email' => 'required|email|unique:users',
             'phone' => 'required',
             'district_id' => 'required|exists:districts,id',
             'password' => 'required|min:6',
@@ -70,15 +71,13 @@ public function register(Request $request)
             'experience' => 'nullable|string',
             'service_area' => 'nullable|array',
             'availability' => 'nullable|array',
-            'services' => 'nullable|array', // ✅ Added services validation
-            // ✅ Service categories (many-to-many). Technician ke liye required.
+            'services' => 'nullable|array',
             'category_ids' => 'required_if:user_type,technician|array',
             'category_ids.*' => 'integer|exists:service_categories,id',
             'work_gallery' => 'nullable|array|max:20',
             'work_gallery.*' => 'file|mimes:jpg,jpeg,png,webp|max:5120',
             'work_gallery_captions' => 'nullable|array',
             'work_gallery_captions.*' => 'nullable|string|max:255',
-            // ❌ REMOVED: 'subscription_id' => 'nullable|exists:subscriptions,id',
             'shop_reference_code' => 'nullable|string|exists:shops,reference_code',
         ];
         
@@ -90,7 +89,7 @@ public function register(Request $request)
             $rules['availability.*.is_available'] = 'nullable|boolean';
         }
         
-        $request->validate($rules); // ✅ Validation will fail if email already exists
+        $request->validate($rules);
         
         // ✅ Ensure directory exists
         $uploadPath = public_path('backend/img');
@@ -105,17 +104,20 @@ public function register(Request $request)
         $certificates = null;
         $skills = null;
         $service_area = null;
-        $services = null; // ✅ Added services variable
+        $services = null;
         
         // ✅ File upload handling (only for technician)
         if ($request->user_type == 'technician') {
+
             // ✅ Store CNIC Front
             if ($request->hasFile('cnic_front')) {
                 $file = $request->file('cnic_front');
+
                 if ($file->isValid()) {
                     $filename = 'cnic_front_' . time() . '_' . uniqid() . '.' . $file->getClientOriginalExtension();
                     $file->move($uploadPath, $filename);
                     $cnicFront = 'backend/img/' . $filename;
+
                     \Log::info('CNIC Front saved: ' . $cnicFront);
                 }
             }
@@ -123,10 +125,12 @@ public function register(Request $request)
             // ✅ Store CNIC Back
             if ($request->hasFile('cnic_back')) {
                 $file = $request->file('cnic_back');
+
                 if ($file->isValid()) {
                     $filename = 'cnic_back_' . time() . '_' . uniqid() . '.' . $file->getClientOriginalExtension();
                     $file->move($uploadPath, $filename);
                     $cnicBack = 'backend/img/' . $filename;
+
                     \Log::info('CNIC Back saved: ' . $cnicBack);
                 }
             }
@@ -134,10 +138,12 @@ public function register(Request $request)
             // ✅ Store Profile Photo
             if ($request->hasFile('photo')) {
                 $file = $request->file('photo');
+
                 if ($file->isValid()) {
                     $filename = 'profile_' . time() . '_' . uniqid() . '.' . $file->getClientOriginalExtension();
                     $file->move($uploadPath, $filename);
                     $photo = 'backend/img/' . $filename;
+
                     \Log::info('Profile photo saved: ' . $photo);
                 }
             }
@@ -149,35 +155,55 @@ public function register(Request $request)
                 $certificatesInput = $request->file('certificates');
                 
                 if (!is_array($certificatesInput)) {
+
                     if ($certificatesInput->isValid()) {
                         $filename = 'cert_' . time() . '_' . uniqid() . '.' . $certificatesInput->getClientOriginalExtension();
                         $certificatesInput->move($uploadPath, $filename);
                         $certificatesArray[] = 'backend/img/' . $filename;
                     }
+
                 } else {
+
                     foreach ($certificatesInput as $file) {
+
                         if ($file && $file->isValid()) {
                             $filename = 'cert_' . time() . '_' . uniqid() . '_' . rand(1000, 9999) . '.' . $file->getClientOriginalExtension();
                             $file->move($uploadPath, $filename);
                             $certificatesArray[] = 'backend/img/' . $filename;
                         }
+
                     }
                 }
             }
             
-            if (empty($certificatesArray) && $request->has('certificates') && is_string($request->certificates)) {
+            if (
+                empty($certificatesArray) &&
+                $request->has('certificates') &&
+                is_string($request->certificates)
+            ) {
                 $decoded = json_decode($request->certificates, true);
+
                 if (is_array($decoded)) {
                     $certificatesArray = $decoded;
                 }
             }
             
-            $certificates = !empty($certificatesArray) ? json_encode($certificatesArray) : null;
-            $skills = $request->has('skills') ? json_encode($request->skills) : null;
-            $service_area = $request->has('service_area') ? json_encode($request->service_area) : null;
+            $certificates = !empty($certificatesArray)
+                ? json_encode($certificatesArray)
+                : null;
+
+            $skills = $request->has('skills')
+                ? json_encode($request->skills)
+                : null;
+
+            $service_area = $request->has('service_area')
+                ? json_encode($request->service_area)
+                : null;
             
-            // ✅ Store services as JSON (matching the 'services' column in database)
-            $services = $request->has('services') ? json_encode($request->services) : null;
+            // ✅ Store services as JSON
+            $services = $request->has('services')
+                ? json_encode($request->services)
+                : null;
         }
         
         // ✅ Generate OTP
@@ -185,8 +211,12 @@ public function register(Request $request)
         
         // ✅ Resolve shop reference code
         $referralShopId = null;
+
         if ($request->filled('shop_reference_code')) {
-            $referralShopId = \App\Models\Shop::where('reference_code', $request->shop_reference_code)->value('id');
+            $referralShopId = \App\Models\Shop::where(
+                'reference_code',
+                $request->shop_reference_code
+            )->value('id');
         }
         
         // ✅ Build user data (NOT saved to database)
@@ -195,11 +225,11 @@ public function register(Request $request)
             'name' => $request->name,
             'email' => $request->email,
             'phone' => $request->phone,
-            // `fcmtoken` and `address` are NOT NULL columns with no default in
-            // the `users` table - always provide a value to avoid an insert
-            // failure on strict-mode MySQL.
+
+            // Existing response remains exactly the same
             'fcmtoken' => $request->fcmtoken ?? $request->fcm_token ?? '',
             'address' => $request->address ?? '',
+
             'district_id' => $request->district_id,
             'password' => Hash::make($request->password),
             'otp' => $otp,
@@ -212,24 +242,44 @@ public function register(Request $request)
             'skills' => $skills,
             'experience' => $request->experience,
             'service_area' => $service_area,
-            'services' => $services, // ✅ Added services field
-            'status' => $request->user_type == 'technician' ? 'pending' : 'active',
-            // ❌ REMOVED: 'subscription_id' => $request->user_type == 'technician' ? $request->subscription_id : null,
+            'services' => $services,
+            'status' => $request->user_type == 'technician'
+                ? 'pending'
+                : 'active',
             'shop_reference_code' => $request->shop_reference_code,
             'referral_shop_id' => $referralShopId,
+        ];
+
+        // ============================================================
+        // ✅ ONLY NEW ADDITION:
+        // Keep address separately for UserSavedAddress after OTP verify
+        // ============================================================
+        $savedAddressData = [
+            'label' => 'Home',
+            'address' => $request->address ?? '',
+            'city' => $request->city ?? '',
         ];
         
         // ✅ Availability data
         $availabilityData = [];
+
         if ($request->user_type == 'technician') {
-            $availabilityData = $request->has('availability') && !empty($request->availability)
+            $availabilityData = $request->has('availability') &&
+                !empty($request->availability)
                 ? $request->availability
                 : $this->getDefaultAvailability();
         }
         
-        // ✅ Service category ids (many-to-many) - saved on OTP verify
+        // ✅ Service category ids
         $categoryIds = $request->user_type == 'technician'
-            ? array_values(array_unique(array_map('intval', (array) $request->input('category_ids', []))))
+            ? array_values(
+                array_unique(
+                    array_map(
+                        'intval',
+                        (array) $request->input('category_ids', [])
+                    )
+                )
+            )
             : [];
 
         $workGalleryItems = $request->user_type == 'technician'
@@ -237,51 +287,97 @@ public function register(Request $request)
             : [];
 
         // #region agent log
-        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H1', 'location' => 'AuthController::register', 'message' => 'register work gallery files', 'data' => ['user_type' => $request->user_type, 'has_work_gallery' => $request->hasFile('work_gallery'), 'saved_count' => count($workGalleryItems)], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        @file_put_contents(
+            base_path('debug-545283.log'),
+            json_encode([
+                'sessionId' => '545283',
+                'hypothesisId' => 'H1',
+                'location' => 'AuthController::register',
+                'message' => 'register work gallery files',
+                'data' => [
+                    'user_type' => $request->user_type,
+                    'has_work_gallery' => $request->hasFile('work_gallery'),
+                    'saved_count' => count($workGalleryItems)
+                ],
+                'timestamp' => (int) round(microtime(true) * 1000)
+            ]) . "\n",
+            FILE_APPEND
+        );
         // #endregion
 
         // ✅ Store in cache (NOT in database)
-        Cache::put(self::PENDING_REGISTRATION_PREFIX . strtolower($request->email), [
-            'user_data' => $userData,
-            'availability' => $availabilityData,
-            'category_ids' => $categoryIds,
-            'work_gallery' => $workGalleryItems,
-        ], now()->addMinutes(30));
+        Cache::put(
+            self::PENDING_REGISTRATION_PREFIX . strtolower($request->email),
+            [
+                'user_data' => $userData,
+                'availability' => $availabilityData,
+                'category_ids' => $categoryIds,
+                'work_gallery' => $workGalleryItems,
+
+                // ====================================================
+                // ✅ ONLY NEW CACHE DATA FOR ADDRESS
+                // ====================================================
+                'saved_address' => $savedAddressData,
+
+            ],
+            now()->addMinutes(30)
+        );
         
-        \Log::info('Pending registration cached (not saved to users table)', ['email' => $request->email]);
+        \Log::info(
+            'Pending registration cached (not saved to users table)',
+            ['email' => $request->email]
+        );
         
-        // ✅ Send OTP via email — error return hoga agar mail fail ho
+        // ✅ Send OTP via email
         $emailError = null;
+
         try {
-            $this->sendOtpMail($request->email, $request->name, $otp);
+            $this->sendOtpMail(
+                $request->email,
+                $request->name,
+                $otp
+            );
+
             \Log::info('OTP email sent to: ' . $request->email);
+
         } catch (\Exception $e) {
+
             $emailError = $e->getMessage();
+
             \Log::error('OTP email failed: ' . $emailError);
         }
         
         // ✅ Prepare response with ALL request data + OTP
-        $responseUser = collect($userData)->except(['password'])->toArray(); // ✅ OTP included in response
+        $responseUser = collect($userData)
+            ->except(['password'])
+            ->toArray();
+
         $responseUser['category_ids'] = $categoryIds;
-        $responseUser['work_gallery'] = collect($workGalleryItems)->map(function ($item) {
-            return [
-                'image' => asset($item['image']),
-                'caption' => $item['caption'] ?? null,
-            ];
-        })->values();
+
+        $responseUser['work_gallery'] = collect($workGalleryItems)
+            ->map(function ($item) {
+                return [
+                    'image' => asset($item['image']),
+                    'caption' => $item['caption'] ?? null,
+                ];
+            })
+            ->values();
         
         // ✅ Add availability to response
-        $responseUser['availabilities'] = collect($availabilityData)->map(function ($schedule) {
-            return [
-                'day' => $schedule['day'] ?? null,
-                'start_time' => $schedule['start'] ?? null,
-                'end_time' => $schedule['end'] ?? null,
-                'is_available' => $schedule['is_available'] ?? true,
-                'specific_date' => $schedule['specific_date'] ?? null,
-            ];
-        })->values();
+        $responseUser['availabilities'] = collect($availabilityData)
+            ->map(function ($schedule) {
+                return [
+                    'day' => $schedule['day'] ?? null,
+                    'start_time' => $schedule['start'] ?? null,
+                    'end_time' => $schedule['end'] ?? null,
+                    'is_available' => $schedule['is_available'] ?? true,
+                    'specific_date' => $schedule['specific_date'] ?? null,
+                ];
+            })
+            ->values();
 
         if ($emailError) {
+
             return response()->json([
                 'message' => 'Registration data saved temporarily, but OTP email failed to send.',
                 'email_sent' => false,
@@ -296,12 +392,12 @@ public function register(Request $request)
             'message' => 'OTP sent to your email. Please verify the OTP.',
             'email_sent' => true,
             'user' => $responseUser,
-            'otp' => $otp, // ✅ OTP explicitly in response
-            'email_exists' => false, // ✅ Already validated by unique rule
+            'otp' => $otp,
+            'email_exists' => false,
         ], 200);
         
     } catch (\Illuminate\Validation\ValidationException $e) {
-        // ✅ Handle validation errors (including email already exists)
+
         \Log::error('Validation failed: ' . $e->getMessage());
         
         return response()->json([
@@ -310,6 +406,7 @@ public function register(Request $request)
         ], 422);
         
     } catch (\Exception $e) {
+
         \Log::error('Registration failed: ' . $e->getMessage());
         \Log::error('Stack trace: ' . $e->getTraceAsString());
         
@@ -515,6 +612,15 @@ public function registerresendOtp(Request $request)
         // ✅ CREATE USER IN DATABASE
         $user = User::create($userData);
 
+        // ✅ Save registration address in UserSavedAddress
+        $savedAddressData = $pending['saved_address'] ?? [];
+        UserSavedAddress::create([
+            'user_id' => $user->id,
+            'label' => $savedAddressData['label'] ?? 'Home',
+            'address' => $savedAddressData['address'] ?? ($user->address ?? ''),
+            'city' => $savedAddressData['city'] ?? '',
+        ]);
+
         // ✅ Attach service categories (many-to-many) - only after OTP verified
         if (!empty($pending['category_ids'])) {
             $user->serviceCategories()->sync($pending['category_ids']);
@@ -605,13 +711,27 @@ public function registerresendOtp(Request $request)
     public function login(Request $request)
     {
         $request->validate([
+            'user_type' => 'required|in:customer,technician',
             'email' => 'required|email',
             'password' => 'required',
         ]);
 
         $user = User::where('email', $request->email)->first();
 
-        if (!$user || !Hash::check($request->password, $user->password)) {
+        if (!$user) {
+            return response()->json(['error' => 'Invalid credentials'], 401);
+        }
+
+        if ($user->user_type !== $request->user_type) {
+            $correctType = ucfirst($user->user_type);
+
+            return response()->json([
+                'error' => 'Incorrect user type',
+                'message' => "This email is registered as {$correctType}. Please select {$correctType} and try again.",
+            ], 403);
+        }
+
+        if (!Hash::check($request->password, $user->password)) {
             return response()->json(['error' => 'Invalid credentials'], 401);
         }
 

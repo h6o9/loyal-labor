@@ -42,6 +42,8 @@ Route::post('/register-verify-otp', [AuthController::class, 'registerVerifyOtp']
 Route::post('/verify-otp', [AuthController::class, 'verifyOtp']);
 Route::post('/login', [AuthController::class, 'login']);
 Route::get('/districts', [DistrictController::class, 'index']);
+Route::match(['get', 'post'], '/districts/{districtId}/cities', [DistrictController::class, 'cities']);
+Route::match(['get', 'post'], '/cities', [DistrictController::class, 'cities']);
 Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
 Route::post('/reset-password', [AuthController::class, 'resetPassword']);
 Route::get('/technicians', [TechnicianController::class, 'getTechnicians']);
@@ -81,6 +83,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/technician/work-gallery', [TechnicianController::class, 'uploadWorkGallery']);
     Route::get('/technician/work-gallery', [TechnicianController::class, 'myWorkGallery']);
     Route::delete('/technician/work-gallery/{galleryId}', [TechnicianController::class, 'deleteWorkGallery']);
+    Route::match(['get', 'post'], '/technician/active-jobs', [BookingController::class, 'activeJobs']);
+    Route::match(['get', 'post'], '/technician/pending-requests', [BookingController::class, 'pendingRequests']);
 
     // Bookings
     Route::post('/bookings/broadcast', [BookingController::class, 'broadcastRequest']);
@@ -88,6 +92,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/bookings', [BookingController::class, 'bookTechnician']);
     Route::get('/bookings/my', [BookingController::class, 'myBookings']);
     Route::get('/bookings/requests', [BookingController::class, 'getBookingRequests']);
+    Route::match(['get', 'post'], '/bookings/active-jobs', [BookingController::class, 'activeJobs']);
+    Route::match(['get', 'post'], '/bookings/pending-requests', [BookingController::class, 'pendingRequests']);
     Route::get('/bookings/{bookingId}/confirmation', [BookingController::class, 'getBookingConfirmation']);
     Route::get('/bookings/{bookingId}/status', [BookingController::class, 'getBookingStatus']);
     Route::get('/bookings/{bookingId}', [BookingController::class, 'getBookingDetails']);

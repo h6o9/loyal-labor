@@ -108,8 +108,13 @@ class AppServiceProvider extends ServiceProvider
         config(['mail.mailers.smtp' => $mailConfig]);
 
         $senderName = loyalSanitizeBrandText((string) ($setting?->mail_sender_name ?? ''));
+        $smtpUser = trim((string) ($setting?->mail_username ?? ''));
+        $senderEmail = trim((string) ($setting?->mail_sender_email ?? ''));
 
-        config(['mail.from.address' => $setting?->mail_sender_email]);
+        // SMTP servers reject From addresses that are not the authenticated mailbox.
+        $fromAddress = $smtpUser !== '' ? $smtpUser : $senderEmail;
+
+        config(['mail.from.address' => $fromAddress]);
         config(['mail.from.name' => $senderName !== '' ? $senderName : loyalBrandName()]);
     }
 

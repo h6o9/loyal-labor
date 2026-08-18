@@ -27,34 +27,40 @@ class SavedAddressController extends Controller
         ]);
     }
 
-    public function store(Request $request)
-    {
-        $user = $request->user();
-        $data = $this->validatedAddress($request);
+ public function store(Request $request)
+{
+    $user = $request->user();
 
-        $isDefault = $request->boolean('is_default') || UserSavedAddress::where('user_id', $user->id)->count() === 0;
-        if ($isDefault) {
-            UserSavedAddress::where('user_id', $user->id)->update(['is_default' => false]);
-        }
+    $data = $this->validatedAddress($request);
 
-        $address = UserSavedAddress::create([
-            'user_id' => $user->id,
-            'label' => $data['label'],
-            'address' => $data['address'],
-            'city' => $data['city'],
-            'is_default' => $isDefault,
-        ]);
+    // Check if user already has any saved address
+    $hasAddresses = UserSavedAddress::where('user_id', $user->id)->exists();
 
-        // #region agent log
-        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'hypothesisId' => 'H2', 'location' => 'SavedAddressController::store', 'message' => 'saved address created', 'data' => ['user_id' => $user->id, 'id' => $address->id, 'is_default' => $isDefault, 'label' => $address->label], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
-        // #endregion
+    // First address will automatically become default
+    // Otherwise use the value sent by user
+    $isDefault = !$hasAddresses || $request->boolean('is_default');
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Address saved successfully.',
-            'data' => $address->toApiArray(),
-        ], 201);
+    // If this address is default, remove default from all other addresses
+    if ($isDefault) {
+        UserSavedAddress::where('user_id', $user->id)
+            ->update(['is_default' => false]);
     }
+
+    // Create new address
+    $address = UserSavedAddress::create([
+        'user_id'    => $user->id,
+        'label'      => $data['label'],
+        'address'    => $data['address'],
+        'city'       => $data['city'],
+        'is_default' => $isDefault,
+    ]);
+
+    return response()->json([
+        'success' => true,
+        'message' => 'Address saved successfully.',
+        'data'    => $address->toApiArray(),
+    ], 201);
+}
 
     public function update(Request $request, $id)
     {

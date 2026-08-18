@@ -164,12 +164,29 @@ class BookingController extends Controller
 
     private function resolveBookingServiceCategory(Booking $booking): ?array
     {
-        if ($booking->serviceCategory) {
+        $category = $booking->serviceCategory;
+        if (!$category && $booking->service_category_id) {
+            $category = ServiceCategory::find($booking->service_category_id);
+        }
+
+        if ($category) {
             return [
-                'id' => $booking->serviceCategory->id,
-                'name' => $booking->serviceCategory->name,
-                'slug' => $booking->serviceCategory->slug,
-                'icon' => $booking->serviceCategory->icon,
+                'id' => $category->id,
+                'name' => $category->name,
+                'slug' => $category->slug,
+                'icon' => $category->icon,
+            ];
+        }
+
+        $matchedFromDetails = $this->matchServiceCategoryFromText(
+            trim(implode(' ', array_filter([$booking->service_details, $booking->additional_notes])))
+        );
+        if ($matchedFromDetails) {
+            return [
+                'id' => $matchedFromDetails->id,
+                'name' => $matchedFromDetails->name,
+                'slug' => $matchedFromDetails->slug,
+                'icon' => $matchedFromDetails->icon,
             ];
         }
 
@@ -178,7 +195,11 @@ class BookingController extends Controller
             return null;
         }
 
-        if ($technician->relationLoaded('serviceCategories') && $technician->serviceCategories->isNotEmpty()) {
+        if (!$technician->relationLoaded('serviceCategories')) {
+            $technician->load('serviceCategories');
+        }
+
+        if ($technician->serviceCategories->isNotEmpty()) {
             $category = $technician->serviceCategories->first();
 
             return [
@@ -203,6 +224,58 @@ class BookingController extends Controller
                     'slug' => $slug,
                     'icon' => null,
                 ];
+            }
+        }
+
+        return null;
+    }
+
+    private function resolveJobServiceCategoryName(Booking $booking): string
+    {
+        $category = $this->resolveBookingServiceCategory($booking);
+        if (!empty($category['name'])) {
+            return $category['name'];
+        }
+
+        $searchText = trim(implode(' ', array_filter([
+            $booking->service_details,
+            $booking->additional_notes,
+        ])));
+
+        if ($searchText !== '') {
+            $matched = $this->matchServiceCategoryFromText($searchText);
+            if ($matched) {
+                return $matched->name;
+            }
+        }
+
+        return 'N/A';
+    }
+
+    private function matchServiceCategoryFromText(?string $searchText): ?ServiceCategory
+    {
+        $searchText = trim((string) $searchText);
+        if ($searchText === '') {
+            return null;
+        }
+
+        $exact = ServiceCategory::query()
+            ->where('name', $searchText)
+            ->orWhere('slug', strtolower(str_replace(' ', '-', $searchText)))
+            ->orderBy('sort_order')
+            ->first();
+
+        if ($exact) {
+            return $exact;
+        }
+
+        foreach (ServiceCategory::query()->orderBy('sort_order')->get() as $item) {
+            $slugName = $item->slug ? str_replace('-', ' ', $item->slug) : '';
+            if (
+                stripos($searchText, $item->name) !== false
+                || ($slugName !== '' && stripos($searchText, $slugName) !== false)
+            ) {
+                return $item;
             }
         }
 
@@ -544,7 +617,17 @@ class BookingController extends Controller
     // Customer: Book a technician
     public function bookTechnician(Request $request)
     {
-        
+        $request->validate([
+            'technician_id' => 'required',
+            'service_date' => 'required',
+            'time_slot' => 'required',
+            'service_details' => 'required|string',
+            'address' => 'required|string',
+            'city' => 'nullable|string',
+            'emergency_level' => 'nullable|string',
+            'service_category_id' => 'nullable|integer|exists:service_categories,id',
+            'category_id' => 'nullable|integer|exists:service_categories,id',
+        ]);
 
         $customer = $request->user();
         $technician = User::where('id', $request->technician_id)
@@ -556,12 +639,47 @@ class BookingController extends Controller
             return response()->json(['error' => 'Technician not found or not active'], 404);
         }
 
+        $emergency = strtolower(trim((string) ($request->emergency_level ?: 'low')));
+        $isNowRequest = in_array($emergency, ['now', 'immediate'], true);
+        $storedEmergency = match ($emergency) {
+            'now', 'immediate', 'emergency' => 'emergency',
+            'high' => 'high',
+            'medium' => 'medium',
+            default => 'low',
+        };
+
+        $requestedAt = $this->parseRequestedBookingDateTime($request->service_date, $request->time_slot);
+        if (!$requestedAt) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Invalid service date or time. Use a valid current or future date/time.',
+            ], 422);
+        }
+
+        $now = Carbon::now();
+
+        if ($requestedAt->lt($now->copy()->subMinutes(2))) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Past date/time is not allowed. Please select current or future date and time.',
+                'requested_at' => $requestedAt->format('Y-m-d H:i:s'),
+                'server_time' => $now->format('Y-m-d H:i:s'),
+            ], 422);
+        }
+
+        if ($isNowRequest) {
+            $requestedAt = $now;
+        }
+
+        $serviceDate = $requestedAt->toDateString();
+        $timeSlot = $requestedAt->format('H:i:s');
+
         // Check if technician is available on that date/time
         if (!$this->isTechnicianAvailable(
             $technician->id,
-            $request->service_date,
-            $request->time_slot,
-            $request->emergency_level,
+            $serviceDate,
+            $timeSlot,
+            $storedEmergency,
             $technician
         )) {
             return response()->json(['error' => 'Technician not available at this time'], 400);
@@ -569,9 +687,9 @@ class BookingController extends Controller
 
         // Check for existing booking conflict
         $existingBooking = Booking::where('technician_id', $technician->id)
-            ->where('service_date', $request->service_date)
-            ->where('time_slot', $request->time_slot)
-            ->whereNotIn('status', ['cancelled', 'completed', 'rejected'])
+            ->whereDate('service_date', $serviceDate)
+            ->whereRaw('TIME(time_slot) = ?', [$timeSlot])
+            ->whereNotIn('status', ['cancelled', 'completed', 'rejected', 'expired'])
             ->exists();
 
         if ($existingBooking) {
@@ -580,14 +698,28 @@ class BookingController extends Controller
 
         $expiryMinutes = $this->bookingExpiryMinutes();
 
+        $categoryId = $request->input('service_category_id') ?? $request->input('category_id');
+        if (!$categoryId && $request->filled('service_category')) {
+            $categoryId = ServiceCategory::query()
+                ->where('name', $request->service_category)
+                ->orWhere('slug', $request->service_category)
+                ->value('id');
+        }
+        if (!$categoryId) {
+            $categoryId = $this->matchServiceCategoryFromText($request->service_details)?->id
+                ?? $this->matchServiceCategoryFromText($request->service_category)?->id;
+        }
+
         $booking = Booking::create([
             'customer_id' => $customer->id,
             'technician_id' => $technician->id,
             'booking_type' => 'direct',
-            'emergency_level' => $request->emergency_level,
+            'service_category_id' => $categoryId,
+            'district_id' => $request->district_id,
+            'emergency_level' => $storedEmergency,
             'status' => 'pending',
-            'service_date' => $request->service_date,
-            'time_slot' => $request->time_slot,
+            'service_date' => $serviceDate,
+            'time_slot' => $timeSlot,
             'service_details' => $request->service_details,
             'address' => $request->address,
             'city' => $request->city,
@@ -610,6 +742,95 @@ class BookingController extends Controller
     }
 
     // Technician: Get all booking requests
+    public function activeJobs(Request $request)
+    {
+        $technician = $request->user();
+
+        if ($technician->user_type !== 'technician') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only technicians can view active jobs.',
+            ], 403);
+        }
+
+        $perPage = $this->technicianHomePerPage($request);
+
+        $bookings = Booking::query()
+            ->where('technician_id', $technician->id)
+            ->whereIn('status', ['accepted', 'on_the_way', 'work_started'])
+            ->with([
+                'customer' => function ($query) {
+                    $query->select('id', 'name', 'photo', 'is_verified', 'phone');
+                },
+                'serviceCategory:id,name,slug,icon',
+                'district:id,name',
+                'technician.serviceCategories',
+            ])
+            ->orderByRaw("CASE status WHEN 'on_the_way' THEN 1 WHEN 'work_started' THEN 2 WHEN 'accepted' THEN 3 ELSE 4 END")
+            ->orderBy('service_date')
+            ->orderBy('time_slot')
+            ->paginate($perPage)
+            ->appends($request->query());
+
+        $jobs = collect($bookings->items())->map(function (Booking $booking) {
+            return $this->formatTechnicianActiveJobCard($booking);
+        })->values();
+
+        return response()->json([
+            'success' => true,
+            'message' => $jobs->isEmpty()
+                ? 'No active jobs right now.'
+                : 'Active jobs retrieved successfully.',
+            'data' => [
+                'current_page' => $bookings->currentPage(),
+                'per_page' => $bookings->perPage(),
+                'total' => $bookings->total(),
+                'last_page' => $bookings->lastPage(),
+                'jobs' => $jobs,
+            ],
+        ]);
+    }
+
+    public function pendingRequests(Request $request)
+    {
+        $technician = $request->user();
+
+        if ($technician->user_type !== 'technician') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only technicians can view pending requests.',
+            ], 403);
+        }
+
+        $this->deleteExpiredBroadcastRequests();
+
+        $perPage = $this->technicianHomePerPage($request);
+
+        $bookings = $this->technicianPendingBookingsQuery($technician)
+            ->latest()
+            ->paginate($perPage)
+            ->appends($request->query());
+
+        $requests = collect($bookings->items())->map(function (Booking $booking) use ($technician) {
+            return $this->formatTechnicianPendingRequestCard($booking, $technician);
+        })->values();
+
+        return response()->json([
+            'success' => true,
+            'message' => $requests->isEmpty()
+                ? 'No pending requests right now.'
+                : 'Pending requests retrieved successfully.',
+            'new_count' => $bookings->total(),
+            'data' => [
+                'current_page' => $bookings->currentPage(),
+                'per_page' => $bookings->perPage(),
+                'total' => $bookings->total(),
+                'last_page' => $bookings->lastPage(),
+                'requests' => $requests,
+            ],
+        ]);
+    }
+
     public function getBookingRequests(Request $request)
     {
     $technician = Auth::user();
@@ -622,67 +843,14 @@ class BookingController extends Controller
         }
 
         $status = $request->get('status', 'pending');
-        
-    /*
-    |--------------------------------------------------------------------------
-    | Delete Expired Broadcast Requests
-    |--------------------------------------------------------------------------
-    */
-    Booking::where('booking_type', 'broadcast')
-            ->where('status', 'pending')
-            ->whereNotNull('expires_at')
-        ->where('expires_at', '<', now())
-        ->delete();
 
-    $categoryIds = $technician->serviceCategories()->pluck('service_categories.id');
+        $this->deleteExpiredBroadcastRequests();
 
-    $bookings = Booking::query()
-        ->where(function ($query) use ($technician, $categoryIds) {
-
-            // Assigned bookings
-            $query->where(function ($assigned) use ($technician) {
-                $assigned->where('technician_id', $technician->id)
-                    ->where(function ($expiry) {
-                        $expiry->whereNull('expires_at')
-                            ->orWhere('expires_at', '>=', now());
-                    });
+        $bookings = $this->technicianInboxQuery($technician)
+            ->when($status && $status !== 'all', function ($query) use ($status) {
+                $query->where('status', $status);
             })
-
-            // Broadcast bookings
-            ->orWhere(function ($broadcast) use ($technician, $categoryIds) {
-                $broadcast->where('booking_type', 'broadcast')
-                    ->whereNull('technician_id')
-                    ->where('status', 'pending')
-                    ->where(function ($expiry) {
-                        $expiry->whereNull('expires_at')
-                            ->orWhere('expires_at', '>=', now());
-                    })
-                    ->when(
-                        $categoryIds->isNotEmpty(),
-                        function ($q) use ($categoryIds) {
-                            $q->whereIn('service_category_id', $categoryIds);
-                        },
-                        function ($q) {
-                            $q->whereRaw('1 = 0');
-                        }
-                    )
-                    ->where(function ($district) use ($technician) {
-                        $district->whereNull('district_id')
-                            ->orWhere('district_id', $technician->district_id);
-                    });
-            });
-        })
-        ->when($status && $status !== 'all', function ($query) use ($status) {
-            $query->where('status', $status);
-        })
-        ->with([
-            'customer' => function($query) {
-                $query->select('id', 'name', 'is_verified', 'latitude', 'longitude');
-            },
-            'serviceCategory:id,name',
-            'district:id,name'
-        ])
-        ->latest()
+            ->latest()
             ->paginate(20);
 
     if ($bookings->total() == 0) {
@@ -777,7 +945,7 @@ private function transformBookingRequests($bookings, $technician)
             'customer_initials' => $initials,
             'customer_name' => $customerName,
             'is_verified' => (bool)($booking->customer->is_verified ?? false),
-            'service_category' => $booking->serviceCategory->name ?? 'N/A',
+            'service_category' => $this->resolveJobServiceCategoryName($booking),
             'description' => $booking->service_details ?? $booking->additional_notes ?? null,
             'address' => $fullAddress ?: null,
             'city' => $booking->city ?? null,
@@ -794,6 +962,309 @@ private function transformBookingRequests($bookings, $technician)
     }
 
     return $result;
+}
+
+private function technicianHomePerPage(Request $request): int
+{
+    $perPage = (int) ($request->input('limit') ?: $request->input('per_page', 20));
+
+    return max(1, min($perPage, 50));
+}
+
+private function deleteExpiredBroadcastRequests(): void
+{
+    Booking::where('booking_type', 'broadcast')
+        ->where('status', 'pending')
+        ->whereNotNull('expires_at')
+        ->where('expires_at', '<', now())
+        ->delete();
+}
+
+private function technicianInboxQuery(User $technician)
+{
+    $categoryIds = $technician->serviceCategories()->pluck('service_categories.id');
+
+    return Booking::query()
+        ->where(function ($query) use ($technician, $categoryIds) {
+            $query->where(function ($assigned) use ($technician) {
+                $assigned->where('technician_id', $technician->id)
+                    ->where(function ($expiry) {
+                        $expiry->whereNull('expires_at')
+                            ->orWhere('expires_at', '>=', now());
+                    });
+            })
+            ->orWhere(function ($broadcast) use ($technician, $categoryIds) {
+                $broadcast->where('booking_type', 'broadcast')
+                    ->whereNull('technician_id')
+                    ->where('status', 'pending')
+                    ->where(function ($expiry) {
+                        $expiry->whereNull('expires_at')
+                            ->orWhere('expires_at', '>=', now());
+                    })
+                    ->when(
+                        $categoryIds->isNotEmpty(),
+                        function ($q) use ($categoryIds) {
+                            $q->whereIn('service_category_id', $categoryIds);
+                        },
+                        function ($q) {
+                            $q->whereRaw('1 = 0');
+                        }
+                    )
+                    ->where(function ($district) use ($technician) {
+                        $district->whereNull('district_id')
+                            ->orWhere('district_id', $technician->district_id);
+                    });
+            });
+        })
+        ->with([
+            'customer' => function ($query) {
+                $query->select('id', 'name', 'photo', 'is_verified', 'latitude', 'longitude', 'phone');
+            },
+            'serviceCategory:id,name,slug,icon',
+            'district:id,name',
+            'technician.serviceCategories',
+        ]);
+}
+
+private function technicianPendingBookingsQuery(User $technician)
+{
+    $categoryIds = $technician->serviceCategories()->pluck('service_categories.id');
+
+    return Booking::query()
+        ->where('status', 'pending')
+        ->where(function ($query) use ($technician, $categoryIds) {
+            $query->where(function ($direct) use ($technician) {
+                $direct->where('technician_id', $technician->id)
+                    ->where(function ($type) {
+                        $type->whereNull('booking_type')
+                            ->orWhere('booking_type', 'direct');
+                    })
+                    ->where(function ($expiry) {
+                        $expiry->whereNull('expires_at')
+                            ->orWhere('expires_at', '>=', now());
+                    });
+            })
+            ->orWhere(function ($broadcast) use ($technician, $categoryIds) {
+                $broadcast->where('booking_type', 'broadcast')
+                    ->whereNull('technician_id')
+                    ->where(function ($expiry) {
+                        $expiry->whereNull('expires_at')
+                            ->orWhere('expires_at', '>=', now());
+                    })
+                    ->when(
+                        $categoryIds->isNotEmpty(),
+                        function ($q) use ($categoryIds) {
+                            $q->whereIn('service_category_id', $categoryIds);
+                        },
+                        function ($q) {
+                            $q->whereRaw('1 = 0');
+                        }
+                    )
+                    ->where(function ($district) use ($technician) {
+                        $district->whereNull('district_id');
+                        if ($technician->district_id) {
+                            $district->orWhere('district_id', $technician->district_id);
+                        }
+                    });
+            });
+        })
+        ->with([
+            'customer' => function ($query) {
+                $query->select('id', 'name', 'photo', 'is_verified', 'latitude', 'longitude', 'phone');
+            },
+            'serviceCategory:id,name,slug,icon',
+            'district:id,name',
+            'technician.serviceCategories',
+        ]);
+}
+
+private function formatTechnicianActiveJobCard(Booking $booking): array
+{
+    $status = $this->normalizeBookingStatus($booking->status);
+    $next = $this->nextJobStatus($status);
+    $customerName = $booking->customer->name ?? 'Unknown Customer';
+
+    return [
+        'id' => $booking->id,
+        'booking_reference' => $booking->booking_reference,
+        'customer_name' => $customerName,
+        'customer_initials' => $this->customerInitials($customerName),
+        'customer_photo' => $this->photoUrl($booking->customer->photo ?? null),
+        'service_category_id' => $booking->service_category_id,
+        'service_category' => $this->resolveJobServiceCategoryName($booking),
+        'service_details' => $booking->service_details,
+        'additional_notes' => $booking->additional_notes,
+        'status' => $status,
+        'status_label' => $this->technicianStatusBadge($status),
+        'address' => $this->formatJobAddress($booking),
+        'date' => $this->formatJobDateLabel($booking),
+        'time' => $this->formatTimeSlot12h($booking->time_slot),
+        'scheduled_at' => $this->formatScheduledLabel($booking),
+        'can_update_status' => true,
+        'next_status' => $next['status'] ?? null,
+        'next_status_label' => $next['label'] ?? null,
+        'update_status_endpoint' => '/api/bookings/' . $booking->id . '/status',
+    ];
+}
+
+private function formatTechnicianPendingRequestCard(Booking $booking, User $technician): array
+{
+    $customerName = $booking->customer->name ?? 'Unknown Customer';
+    $distance = $this->calculateDistance(
+        $technician->latitude,
+        $technician->longitude,
+        $booking->customer->latitude ?? null,
+        $booking->customer->longitude ?? null
+    );
+    $isDirect = ($booking->booking_type ?? 'direct') !== 'broadcast';
+
+    return [
+        'id' => $booking->id,
+        'booking_type' => $isDirect ? 'direct' : 'broadcast',
+        'request_source' => $isDirect ? 'assigned_to_you' : 'service_category',
+        'customer_name' => $customerName,
+        'customer_initials' => $this->customerInitials($customerName),
+        'customer_photo' => $this->photoUrl($booking->customer->photo ?? null),
+        'is_verified' => (bool) ($booking->customer->is_verified ?? false),
+        'service_category_id' => $booking->service_category_id,
+        'service_category' => $this->resolveJobServiceCategoryName($booking),
+        'service_details' => $booking->service_details,
+        'description' => $booking->service_details ?? $booking->additional_notes ?? null,
+        'distance' => $distance ? $distance . ' km' : null,
+        'address' => $this->formatJobAddress($booking),
+        'requested_ago' => $this->formatRequestedAgo($booking->created_at),
+        'date' => $this->formatJobDateLabel($booking),
+        'time' => $this->formatTimeSlot12h($booking->time_slot),
+        'priority' => ucfirst($booking->emergency_level ?? 'low'),
+        'expires_at' => $this->getExpiryTime($booking),
+        'status' => $this->normalizeBookingStatus($booking->status),
+        'can_accept' => true,
+        'can_reject' => $isDirect,
+        'accept_endpoint' => '/api/bookings/' . $booking->id . '/accept',
+        'reject_endpoint' => $isDirect ? '/api/bookings/' . $booking->id . '/reject' : null,
+    ];
+}
+
+private function customerInitials(?string $name): string
+{
+    $name = trim((string) $name);
+    if ($name === '') {
+        return 'NA';
+    }
+
+    $initials = '';
+    foreach (preg_split('/\s+/', $name) as $part) {
+        if ($part !== '') {
+            $initials .= strtoupper(substr($part, 0, 1));
+        }
+        if (strlen($initials) >= 2) {
+            break;
+        }
+    }
+
+    return $initials !== '' ? $initials : 'NA';
+}
+
+private function photoUrl(?string $photo): ?string
+{
+    if (!$photo) {
+        return null;
+    }
+
+    if (str_starts_with($photo, 'http://') || str_starts_with($photo, 'https://')) {
+        return $photo;
+    }
+
+    return asset($photo);
+}
+
+private function formatJobAddress(Booking $booking): ?string
+{
+    $parts = array_filter([
+        $booking->address ?: null,
+        $booking->city ?: null,
+        $booking->district->name ?? null,
+    ]);
+
+    return $parts ? implode(', ', $parts) : null;
+}
+
+private function formatJobDateLabel(Booking $booking): ?string
+{
+    $date = $booking->service_date ?? $booking->created_at;
+    if (!$date) {
+        return null;
+    }
+
+    $dateObj = Carbon::parse($date);
+    if ($dateObj->isToday()) {
+        return 'Today';
+    }
+    if ($dateObj->isTomorrow()) {
+        return 'Tomorrow';
+    }
+
+    return $dateObj->format('M d, Y');
+}
+
+private function formatScheduledLabel(Booking $booking): ?string
+{
+    $dateLabel = $this->formatJobDateLabel($booking);
+    $time = $this->formatTimeSlot12h($booking->time_slot);
+
+    if ($dateLabel && $time) {
+        return $dateLabel . ', ' . $time;
+    }
+
+    return $dateLabel ?: $time;
+}
+
+private function formatRequestedAgo($createdAt): ?string
+{
+    if (!$createdAt) {
+        return null;
+    }
+
+    $carbon = Carbon::parse($createdAt);
+    $minutes = (int) $carbon->diffInMinutes(now());
+
+    if ($minutes < 1) {
+        return 'Just now';
+    }
+    if ($minutes < 60) {
+        return $minutes . ' min ago';
+    }
+
+    $hours = intdiv($minutes, 60);
+    if ($hours < 24) {
+        return $hours === 1 ? '1 hour ago' : $hours . ' hours ago';
+    }
+
+    $days = (int) $carbon->diffInDays(now());
+
+    return $days === 1 ? '1 day ago' : $days . ' days ago';
+}
+
+private function technicianStatusBadge(string $status): string
+{
+    return match ($this->normalizeBookingStatus($status)) {
+        'accepted' => 'Accepted',
+        'on_the_way' => 'On the Way',
+        'work_started' => 'Work Started',
+        'pending' => 'Pending',
+        'completed' => 'Completed',
+        default => ucfirst(str_replace('_', ' ', $status)),
+    };
+}
+
+private function nextJobStatus(string $status): ?array
+{
+    return match ($this->normalizeBookingStatus($status)) {
+        'accepted' => ['status' => 'on_the_way', 'label' => 'On the Way'],
+        'on_the_way' => ['status' => 'work_started', 'label' => 'Work Started'],
+        'work_started' => ['status' => 'completed', 'label' => 'Completed'],
+        default => null,
+    };
 }
 
 /**
@@ -836,6 +1307,84 @@ private function getExpiryTime($booking)
     // Return the expiry time in 12-hour format
     return $expires->format('g:i A');
 }
+
+private function parseRequestedBookingDateTime($date, $time): ?Carbon
+{
+    if (!$date || $time === null || $time === '') {
+        return null;
+    }
+
+    $dateString = trim((string) $date);
+    $timeString = trim((string) $time);
+
+    try {
+        $combined = Carbon::parse(trim($dateString . ' ' . $timeString));
+        if ($combined) {
+            return $combined;
+        }
+    } catch (\Throwable $e) {
+        // fall through to stricter parsing
+    }
+
+    try {
+        $datePart = Carbon::parse($dateString)->toDateString();
+    } catch (\Throwable $e) {
+        return null;
+    }
+
+    $parsedTime = null;
+    foreach (['g:i A', 'g:i a', 'h:i A', 'h:i a', 'H:i:s', 'H:i', 'g:iA', 'h:iA'] as $format) {
+        try {
+            $parsedTime = Carbon::createFromFormat('!'.$format, $timeString);
+            if ($parsedTime) {
+                break;
+            }
+        } catch (\Throwable $e) {
+            $parsedTime = null;
+        }
+    }
+
+    if (!$parsedTime) {
+        try {
+            $parsedTime = Carbon::parse($timeString);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    try {
+        return Carbon::parse($datePart . ' ' . $parsedTime->format('H:i:s'));
+    } catch (\Throwable $e) {
+        return null;
+    }
+}
+
+private function technicianHasScheduledSlotConflict(User $technician, Booking $booking): bool
+{
+    // Broadcast / on-demand requests are "now" jobs, not reserved calendar slots.
+    if ($booking->isBroadcast()) {
+        return false;
+    }
+
+    if (!$booking->service_date || !$booking->time_slot) {
+        return false;
+    }
+
+    $serviceDate = Carbon::parse($booking->service_date)->toDateString();
+    $timeSlot = Carbon::parse($booking->time_slot)->format('H:i:s');
+
+    return Booking::where('technician_id', $technician->id)
+        ->where('id', '!=', $booking->id)
+        ->whereDate('service_date', $serviceDate)
+        ->whereRaw('TIME(time_slot) = ?', [$timeSlot])
+        ->whereIn('status', ['accepted', 'on_the_way', 'work_started'])
+        ->where(function ($query) {
+            $query->whereNull('booking_type')
+                ->orWhere('booking_type', 'direct');
+        })
+        ->exists();
+}
+
     // Technician: Accept a booking request
     public function acceptBooking(Request $request, $bookingId)
     {
@@ -877,14 +1426,7 @@ private function getExpiryTime($booking)
             return 'taken';
         }
 
-        $existingAccepted = Booking::where('technician_id', $technician->id)
-            ->where('service_date', $booking->service_date)
-            ->where('time_slot', $booking->time_slot)
-            ->whereIn('status', ['accepted', 'on_the_way', 'work_started'])
-            ->where('id', '!=', $booking->id)
-            ->exists();
-
-        if ($existingAccepted) {
+        if ($this->technicianHasScheduledSlotConflict($technician, $booking)) {
             return 'slot_unavailable';
         }
 
@@ -930,7 +1472,11 @@ private function getExpiryTime($booking)
     }
 
     if ($booking === 'slot_unavailable') {
-        return response()->json(['error' => 'This time slot is no longer available'], 400);
+        return response()->json([
+            'success' => false,
+            'error' => 'This time slot is no longer available',
+            'message' => 'You already have another scheduled job at this date and time.',
+        ], 400);
     }
 
         // Send notification to customer
@@ -962,38 +1508,33 @@ private function transformAcceptedBooking($booking)
     }
     $initials = substr($initials, 0, 2);
 
-    // Get service category name
-    $serviceCategory = $booking->serviceCategory->name ?? 'N/A';
+    $serviceCategory = $this->resolveJobServiceCategoryName($booking);
+    $status = $this->normalizeBookingStatus($booking->status);
+    $next = $this->nextJobStatus($status);
 
     // Build full address
-    $fullAddress = '';
-    if ($booking->address) {
-        $fullAddress = $booking->address;
-    }
-    if ($booking->city) {
-        $fullAddress .= $fullAddress ? ', ' . $booking->city : $booking->city;
-    }
-    if ($booking->district && $booking->district->name) {
-        $fullAddress .= $fullAddress ? ', ' . $booking->district->name : $booking->district->name;
-    }
+    $fullAddress = $this->formatJobAddress($booking);
 
     return [
         'id' => $booking->id,
         'booking_reference' => $booking->booking_reference,
         'customer' => [
-            'id' => $booking->customer->id,
+            'id' => $booking->customer->id ?? null,
             'name' => $customerName,
-            'initials' => $initials,
+            'initials' => $this->customerInitials($customerName),
             'is_verified' => (bool)($booking->customer->is_verified ?? false),
             'phone' => $booking->phone ?? $booking->customer->phone ?? null,
         ],
         'service' => [
             'category' => $serviceCategory,
+            'category_id' => $booking->service_category_id,
             'description' => $booking->service_details ?? $booking->additional_notes ?? null,
+            'service_details' => $booking->service_details,
         ],
         'address' => $fullAddress ?: null,
         'job_progress' => [
-            'status' => $booking->status,
+            'status' => $status,
+            'status_label' => $this->technicianStatusBadge($status),
             'accepted_at' => $booking->accepted_at ? Carbon::parse($booking->accepted_at)->format('g:i A') : null,
             'on_the_way_at' => $booking->on_the_way_at ? Carbon::parse($booking->on_the_way_at)->format('g:i A') : null,
             'work_started_at' => $booking->work_started_at ? Carbon::parse($booking->work_started_at)->format('g:i A') : null,
@@ -1005,7 +1546,11 @@ private function transformAcceptedBooking($booking)
             'emergency_level' => ucfirst($booking->emergency_level ?? 'low'),
             'created_at' => $booking->created_at ? Carbon::parse($booking->created_at)->format('g:i A') : null,
         ],
-        'status' => $booking->status,
+        'status' => $status,
+        'current_status' => $status,
+        'current_status_label' => $this->technicianStatusBadge($status),
+        'next_status' => $next['status'] ?? null,
+        'next_status_label' => $next['label'] ?? null,
     ];
 }
 
@@ -1251,6 +1796,10 @@ private function transformAcceptedBooking($booking)
     // Technician: Update intermediate status
     public function updateStatus(Request $request, $bookingId)
     {
+        if (!$request->filled('status')) {
+            return $this->getBookingStatus($request, $bookingId);
+        }
+
         $technician = $request->user();
 
         if ($technician->user_type !== 'technician') {
@@ -1261,7 +1810,7 @@ private function transformAcceptedBooking($booking)
         'status' => 'required|in:on_the_way,work_started,completed'
         ]);
 
-    $booking = Booking::with('customer')
+    $booking = Booking::with(['customer', 'technician', 'serviceCategory', 'district'])
         ->where('id', $bookingId)
             ->where('technician_id', $technician->id)
         ->whereIn('status', ['accepted', 'on_the_way', 'work_started'])
@@ -1296,13 +1845,20 @@ private function transformAcceptedBooking($booking)
         }
 
         $booking->update($updateData);
+        $booking->refresh()->load(['customer', 'technician', 'serviceCategory', 'district']);
 
         // Notify customer
         $this->notifyCustomer($booking->customer, $booking, $request->status);
 
+        $payload = $this->transformAcceptedBooking($booking);
+
         return response()->json([
             'success' => true,
-            'message' => 'Booking status updated to ' . str_replace('_', ' ', $request->status)
+            'message' => 'Booking status updated to ' . str_replace('_', ' ', $request->status),
+            'current_status' => $payload['current_status'],
+            'current_status_label' => $payload['current_status_label'],
+            'booking' => $payload,
+            'booking_reference' => $booking->booking_reference,
         ]);
     }
     // Customer/Technician: Booking Status screen (track live progress)
@@ -1341,64 +1897,19 @@ private function transformAcceptedBooking($booking)
             $booking->refresh();
         }
 
-        $technician = $booking->technician;
-        $avgRating = 0.0;
-        if ($technician) {
-            $avgRating = round((float) ($technician->approvedTechnicianReviews()->avg('rating') ?? 0), 1);
-        }
-
-        $serviceCategory = $this->resolveBookingServiceCategory($booking);
+        $payload = $this->transformAcceptedBooking($booking);
         $timeline = $this->buildServiceProgressTimeline($booking);
-        $currentStep = collect($timeline)->firstWhere('is_current', true);
-        $canCancel = in_array($booking->status, ['pending', 'accepted'], true);
-
-        $arrivalMessage = null;
-        if ($technician && in_array($booking->status, ['accepted', 'on_the_way'], true)) {
-            $arrivalMessage = 'You will be notified when ' . $technician->name . ' arrives at your location.';
-        }
-
-        // #region agent log
-        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'booking-status', 'hypothesisId' => 'H-STATUS', 'location' => 'BookingController::getBookingStatus', 'message' => 'booking status payload built', 'data' => ['booking_id' => $booking->id, 'status' => $booking->status, 'has_technician' => $technician !== null], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
-        // #endregion
 
         return response()->json([
             'success' => true,
-            'screen' => 'booking_status',
-            'data' => [
-                'id' => $booking->id,
-                'booking_id' => $booking->id,
-                'booking_reference' => $booking->booking_reference,
-                'request_id' => $booking->booking_reference,
-                'status' => $booking->status,
-                'status_label' => $this->formatBookingStatusLabel($booking->status),
-                'current_step' => $currentStep['title'] ?? null,
-                'is_live' => in_array($booking->status, ['accepted', 'on_the_way', 'work_started'], true),
-                'technician' => $technician ? [
-                    'id' => $technician->id,
-                    'name' => $technician->name,
-                    'initials' => $this->getPersonInitials($technician->name),
-                    'photo' => $technician->photo ? asset($technician->photo) : null,
-                    'phone' => $technician->phone,
-                    'profession' => $serviceCategory['name'] ?? null,
-                    'service_category' => $serviceCategory,
-                    'rating' => $avgRating,
-                    'is_verified' => $technician->hasVerifiedPlanBadge() || (bool) $technician->is_verified,
-                    'is_online' => (bool) ($technician->currently_available ?? false),
-                    'currently_available' => (bool) ($technician->currently_available ?? false),
-                ] : null,
-                'contact' => [
-                    'can_call' => !empty($technician?->phone),
-                    'can_chat' => $technician !== null,
-                    'phone' => $technician?->phone,
-                ],
-                'service_details' => $booking->service_details,
-                'address' => $booking->address,
-                'city' => $booking->city,
-                'service_progress' => $timeline,
-                'arrival_message' => $arrivalMessage,
-                'cancellation_allowed' => $canCancel,
-                'cancel_endpoint' => $canCancel ? '/api/bookings/' . $booking->id . '/cancel' : null,
-            ],
+            'message' => 'Booking status retrieved successfully.',
+            'current_status' => $payload['current_status'],
+            'current_status_label' => $payload['current_status_label'],
+            'next_status' => $payload['next_status'],
+            'next_status_label' => $payload['next_status_label'],
+            'booking' => $payload,
+            'booking_reference' => $booking->booking_reference,
+            'service_progress' => $timeline,
         ]);
     }
 
@@ -1640,6 +2151,24 @@ private function transformAcceptedBooking($booking)
             return [
                 'success' => false,
                 'message' => 'Customer email not found.',
+                'email_sent' => false,
+                'otp_sent' => false,
+            ];
+        }
+
+        if (!Schema::hasColumn('bookings', 'completion_otp')
+            || !Schema::hasColumn('bookings', 'completion_otp_expires_at')) {
+            $booking->update([
+                'status' => 'completed',
+                'completed_at' => now(),
+            ]);
+
+            $this->notifyCustomer($customer, $booking, 'completed');
+
+            return [
+                'success' => true,
+                'message' => 'Job marked as completed.',
+                'otp_required' => false,
                 'email_sent' => false,
                 'otp_sent' => false,
             ];
