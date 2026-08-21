@@ -52,6 +52,28 @@
 @push('js')
     @include('admin.partials.system-records-toast')
     <script>
+        var usersTable;
+        window.changeUserStatus = function(id) {
+            $.ajax({
+                url: "{{ url('admin/users/change-status') }}/" + id,
+                type: 'POST',
+                data: { _token: '{{ csrf_token() }}' },
+                success: function (response) {
+                    if (typeof toastr !== 'undefined') {
+                        toastr.success(response.message || 'Status updated');
+                    }
+                },
+                error: function () {
+                    if (typeof toastr !== 'undefined') {
+                        toastr.error('Failed to update status');
+                    }
+                    if (usersTable) {
+                        usersTable.ajax.reload(null, false);
+                    }
+                }
+            });
+        };
+
         $(document).ready(function() {
             $('.select2').select2({
                 placeholder: "{{ __('Search type...') }}",
@@ -60,7 +82,7 @@
                 minimumResultsForSearch: Infinity
             });
 
-            var usersTable = initServerDataTable('#usersTable', {
+            usersTable = initServerDataTable('#usersTable', {
                 url: "{{ route('admin.users.index') }}",
                 data: function(d) {
                     d.type = $('#type_filter').val();

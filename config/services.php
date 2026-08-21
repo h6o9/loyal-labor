@@ -43,4 +43,17 @@ return [
         'active_int'    => 1,
         'inactive_int'  => 0,
     ],
+
+    'google_maps' => [
+        'key' => env('GOOGLE_MAPS_KEY'),
+    ],
+
+    'firebase' => [
+        'credentials' => env('FIREBASE_CREDENTIALS'),
+    ],
+
+    'pusher' => [
+        'key' => env('PUSHER_APP_KEY'),
+        'cluster' => env('PUSHER_APP_CLUSTER', 'ap2'),
+    ],
 ];

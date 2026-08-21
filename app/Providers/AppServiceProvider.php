@@ -4,6 +4,7 @@ namespace App\Providers;
 
 use App\Services\CartService;
 use App\Services\MailSenderService;
+use App\Services\RuntimeMailConfig;
 use Exception;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Pagination\LengthAwarePaginator;
@@ -95,27 +96,7 @@ class AppServiceProvider extends ServiceProvider
 
     protected function setupMailConfiguration($setting): void
     {
-        $mailConfig = [
-            'transport'  => 'smtp',
-            'host'       => $setting?->mail_host,
-            'port'       => $setting?->mail_port,
-            'encryption' => $setting?->mail_encryption,
-            'username'   => $setting?->mail_username,
-            'password'   => $setting?->mail_password,
-            'timeout'    => null,
-        ];
-
-        config(['mail.mailers.smtp' => $mailConfig]);
-
-        $senderName = loyalSanitizeBrandText((string) ($setting?->mail_sender_name ?? ''));
-        $smtpUser = trim((string) ($setting?->mail_username ?? ''));
-        $senderEmail = trim((string) ($setting?->mail_sender_email ?? ''));
-
-        // SMTP servers reject From addresses that are not the authenticated mailbox.
-        $fromAddress = $smtpUser !== '' ? $smtpUser : $senderEmail;
-
-        config(['mail.from.address' => $fromAddress]);
-        config(['mail.from.name' => $senderName !== '' ? $senderName : loyalBrandName()]);
+        RuntimeMailConfig::apply($setting);
     }
 
     protected function setupTimezone($setting): void

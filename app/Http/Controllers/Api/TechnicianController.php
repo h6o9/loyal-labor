@@ -179,15 +179,17 @@ class TechnicianController extends Controller
             return response()->json(['message' => 'Unauthorized'], 403);
         }
 
-        $request->validate([
-            'availability' => 'required|array',
-            'availability.*.day' => 'required|in:monday,tuesday,wednesday,thursday,friday,saturday,sunday',
-            'availability.*.start' => 'nullable|date_format:H:i',
-            'availability.*.end' => 'nullable|date_format:H:i',
-            'availability.*.is_available' => 'boolean',
-        ]);
+        $incoming = $request->input('availability');
+        // #region agent log
+        @file_put_contents(base_path('debug-1d5da7.log'), json_encode(['sessionId' => '1d5da7', 'runId' => 'pre-fix', 'hypothesisId' => 'A,B,C,E', 'location' => 'TechnicianController::updateAvailability:entry', 'message' => 'incoming availability payload', 'data' => ['user_id' => $user->id, 'availability_is_array' => is_array($incoming), 'count' => is_array($incoming) ? count($incoming) : 0, 'first_keys' => is_array($incoming) && isset($incoming[0]) && is_array($incoming[0]) ? array_keys($incoming[0]) : (is_array($incoming) ? array_keys($incoming) : []), 'sample' => is_array($incoming) ? array_slice($incoming, 0, 2) : $incoming, 'all_input_keys' => array_keys($request->all())], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
 
         foreach ($request->availability as $schedule) {
+            $rawStart = $schedule['start'] ?? $schedule['start_time'] ?? null;
+            $rawEnd = $schedule['end'] ?? $schedule['end_time'] ?? null;
+            // #region agent log
+            @file_put_contents(base_path('debug-1d5da7.log'), json_encode(['sessionId' => '1d5da7', 'runId' => 'pre-fix', 'hypothesisId' => 'A,B,C', 'location' => 'TechnicianController::updateAvailability:row', 'message' => 'row before save', 'data' => ['day' => $schedule['day'] ?? null, 'keys' => is_array($schedule) ? array_keys($schedule) : [], 'start' => $schedule['start'] ?? null, 'end' => $schedule['end'] ?? null, 'start_time' => $schedule['start_time'] ?? null, 'end_time' => $schedule['end_time'] ?? null, 'start_ampm' => $schedule['start_ampm'] ?? $schedule['start_period'] ?? null, 'end_ampm' => $schedule['end_ampm'] ?? $schedule['end_period'] ?? null, 'raw_start' => $rawStart, 'raw_end' => $rawEnd, 'start_has_ampm' => is_string($rawStart) && preg_match('/am|pm/i', $rawStart) ? true : false, 'end_has_ampm' => is_string($rawEnd) && preg_match('/am|pm/i', $rawEnd) ? true : false], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+            // #endregion
             TechnicianAvailability::updateOrCreate(
                 [
                     'technician_id' => $user->id,
@@ -202,9 +204,14 @@ class TechnicianController extends Controller
             );
         }
 
+        $saved = TechnicianAvailability::where('technician_id', $user->id)->get();
+        // #region agent log
+        @file_put_contents(base_path('debug-1d5da7.log'), json_encode(['sessionId' => '1d5da7', 'runId' => 'pre-fix', 'hypothesisId' => 'A,D', 'location' => 'TechnicianController::updateAvailability:saved', 'message' => 'saved rows after write', 'data' => ['count' => $saved->count(), 'rows' => $saved->map(fn ($row) => ['id' => $row->id, 'day' => $row->day, 'start_time' => $row->start_time, 'end_time' => $row->end_time, 'attributes' => array_keys($row->getAttributes())])->take(7)->values()], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
         return response()->json([
             'message' => 'Availability updated successfully',
-            'availability' => TechnicianAvailability::where('technician_id', $user->id)->get(),
+            'availability' => $saved,
         ]);
     }
 
@@ -882,6 +889,58 @@ public function getServiceCategory()
             'message' => $e->getMessage(),
         ], 500);
     }
+}
+
+   public function searchServiceCategories(Request $request)
+{
+    $name = trim((string) (
+        $request->input('name')
+        ?? $request->input('search')
+        ?? $request->input('q')
+        ?? ''
+    ));
+
+    $query = ServiceCategory::query()
+        ->where('is_active', true)
+        ->orderBy('sort_order')
+        ->orderBy('name');
+
+    if ($name !== '') {
+        $query->where(function ($q) use ($name) {
+            $q->where('name', 'LIKE', '%' . $name . '%')
+              ->orWhere('slug', 'LIKE', '%' . $name . '%');
+        });
+    }
+
+    $data = $query->get([
+        'id',
+        'name',
+        'slug',
+        'icon',
+        'sort_order'
+    ])->map(function ($category) {
+
+        $iconUrl = $category->iconUrl();
+
+        return [
+            'id' => $category->id,
+            'name' => $category->name,
+            'slug' => $category->slug,
+            'icon' => $iconUrl,
+            'icon_url' => $iconUrl,
+            'sort_order' => (int) $category->sort_order,
+        ];
+    })->values();
+
+    return response()->json([
+        'success' => true,
+        'message' => $data->isEmpty()
+            ? 'No service categories found.'
+            : 'Service categories retrieved successfully.',
+        'search' => $name,
+        'total' => $data->count(),
+        'data' => $data,
+    ]);
 }
 
 }

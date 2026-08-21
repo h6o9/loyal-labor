@@ -16,9 +16,14 @@ class Booking extends Model
         'service_date' => 'date',
         'time_slot' => 'datetime:H:i',
         'accepted_at' => 'datetime',
+        'on_the_way_at' => 'datetime',
+        'work_started_at' => 'datetime',
+        'work_in_progress_at' => 'datetime',
         'completed_at' => 'datetime',
         'cancelled_at' => 'datetime',
-        'expires_at' => 'datetime',
+        'last_expand_prompt_at' => 'datetime',
+        'latitude' => 'float',
+        'longitude' => 'float',
         'completion_otp_expires_at' => 'datetime',
     ];
 

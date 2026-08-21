@@ -4,12 +4,16 @@ namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Models\User;
+use App\Traits\GlobalMailTrait;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
 use Yajra\DataTables\Facades\DataTables;
 
 class UserController extends Controller
 {
+    use GlobalMailTrait;
+
     public function index(Request $request)
     {
         checkAdminHasPermissionAndThrowException('users.view');
@@ -27,7 +31,7 @@ class UserController extends Controller
         if ($request->ajax() || $request->has('draw') || $request->has('start')) {
             return DataTables::of($query)
                 ->editColumn('name', function ($user) {
-                    return e($user->name) . ' (ID: ' . $user->id . ')';
+                    return e($user->name);
                 })
                 ->editColumn('user_type', function ($user) {
                     return $user->user_type === 'customer' ? 'User' : ucfirst($user->user_type);
@@ -48,6 +52,11 @@ class UserController extends Controller
                     }
 
                     $html = '<span class="badge badge-' . $badgeColor . '">' . ucfirst($displayStatus) . '</span>';
+
+                    if (checkAdminHasPermission('users.edit')) {
+                        $checked = $user->status === 'active' ? 'checked' : '';
+                        $html .= '<div class="mt-1"><input onchange="changeUserStatus(' . $user->id . ')" id="status_toggle_' . $user->id . '" type="checkbox" ' . $checked . ' data-toggle="toggle" data-onlabel="' . __('Active') . '" data-offlabel="' . __('Inactive') . '" data-onstyle="success" data-offstyle="danger" data-size="small"></div>';
+                    }
 
                     if ($user->user_type === 'technician') {
                         try {
@@ -285,4 +294,38 @@ class UserController extends Controller
         ]);
     }
 }
+
+    public function changeStatus($id)
+    {
+        checkAdminHasPermissionAndThrowException('users.edit');
+
+        $user = User::findOrFail($id);
+        $user->status = $user->status === 'active' ? 'inactive' : 'active';
+        $user->save();
+
+        if ($user->status === 'inactive' && !empty($user->email)) {
+            try {
+                $this->sendAccountDeactivatedMail($user);
+            } catch (\Exception $e) {
+                Log::error('Account deactivation email failed: ' . $e->getMessage());
+            }
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => $user->status === 'active' ? 'User activated.' : 'User deactivated.',
+            'status' => $user->status,
+        ]);
+    }
+
+    private function sendAccountDeactivatedMail(User $user): void
+    {
+        $appName = loyalBrandName();
+        $subject = $appName . ' - Account Deactivated';
+        $message = '<p style="margin:0 0 12px;">Dear ' . e($user->name) . ',</p>'
+            . '<p style="margin:0 0 12px;">Your account has been deactivated by the admin.</p>'
+            . '<p style="margin:0;">For further information, please contact the admin.</p>';
+
+        $this->sendMail($user->email, $subject, $message, [], true);
+    }
 }

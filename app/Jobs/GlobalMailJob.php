@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Mail\GlobalMail;
+use App\Services\RuntimeMailConfig;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -43,8 +44,10 @@ class GlobalMailJob implements ShouldQueue
      */
     public function handle(): void
     {
+        RuntimeMailConfig::apply();
+
         try {
-            Mail::to($this->mail_address)->send(new GlobalMail($this->mail_subject, $this->mail_message, $this->link));
+            Mail::mailer('smtp')->to($this->mail_address)->send(new GlobalMail($this->mail_subject, $this->mail_message, $this->link));
         } catch (\Exception $e) {
             info($e->getMessage());
             throw $e;

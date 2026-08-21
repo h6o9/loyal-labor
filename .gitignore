@@ -7,6 +7,7 @@
 /public/uploads/custom-images
 /public/uploads/kyc-files
 /storage/*.key
+/storage/app/firebase/*.json
 /TopCommerce
 # /vendor
 .env.backup

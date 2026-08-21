@@ -432,7 +432,7 @@ private function sendOtpMail(string $email, string $userName, string $otp): void
         $message = '<p style="margin:0 0 12px;">Dear ' . e($userName) . ',</p><p>Your verification code is: <strong style="color:#FE7701;font-size:24px;letter-spacing:6px;">' . e($otp) . '</strong></p><p style="font-size:13px;color:#999;">This code expires in 30 minutes.</p>';
     }
 
-    $this->sendMail($email, $subject, $message);
+        $this->sendMail($email, $subject, $message, [], true);
 }
 
 private function sendPasswordResetOtpMail(string $email, string $userName, string $otp): void
@@ -450,7 +450,7 @@ private function sendPasswordResetOtpMail(string $email, string $userName, strin
         $message = '<p style="margin:0 0 12px;">Dear ' . e($userName) . ',</p><p>Your password reset code is: <strong style="color:#FE7701;font-size:24px;letter-spacing:6px;">' . e($otp) . '</strong></p><p style="font-size:13px;color:#999;">This code expires in 30 minutes.</p>';
     }
 
-    $this->sendMail($email, $subject, $message);
+        $this->sendMail($email, $subject, $message, [], true);
 }
 
 // Helper method for default availability
@@ -481,14 +481,32 @@ private function getDefaultAvailability(): array
     public function verifyOtp(Request $request)
     {
         $request->validate([
-            'email' => 'required|email|exists:users',
+            'email' => 'required|email',
             'otp' => 'required',
         ]);
 
-        $user = User::where('email', $request->email)->first();
+        $email = strtolower($request->email);
+        $pendingKey = self::PENDING_REGISTRATION_PREFIX . $email;
 
-        if ($user->otp != $request->otp) {
-            return response()->json(['error' => 'Invalid OTP'], 400);
+        // Register stores the user in cache until OTP is verified — the row
+        // is not in `users` yet, so exists:users was rejecting valid OTPs.
+        if (Cache::has($pendingKey)) {
+            return $this->registerVerifyOtp($request);
+        }
+
+        $user = User::whereRaw('LOWER(email) = ?', [$email])->first();
+
+        if (!$user) {
+            return response()->json([
+                'message' => 'No pending registration found for this email, or the OTP has expired. Please register again.',
+                'errors' => [
+                    'email' => ['No account or pending registration found for this email.'],
+                ],
+            ], 422);
+        }
+
+        if ((string) $user->otp !== (string) $request->otp) {
+            return response()->json(['message' => 'Invalid OTP'], 400);
         }
 
         $user->update(['is_verified' => true, 'otp' => null]);

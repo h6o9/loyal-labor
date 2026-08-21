@@ -2,17 +2,22 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Events\BroadcastServiceRequestCreated;
 use App\Models\Booking;
+use App\Models\BookingBroadcastNotified;
+use App\Models\BookingIndividualOffer;
+use App\Models\District;
+use App\Models\ServiceCategory;
 use App\Models\User;
-use App\Models\District;         // ✅ Yeh bhi add karein (agar use kar rahe hain)
-use App\Models\ServiceCategory;  // ✅ Yeh import add karein
+use App\Services\BroadcastRadiusService;
 use App\Support\BookingReference;
 use App\Traits\GlobalMailTrait;
-use App\Events\BroadcastServiceRequestCreated;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 
 class BookingController extends Controller
@@ -65,7 +70,7 @@ class BookingController extends Controller
         $status = $this->normalizeBookingStatus($status);
 
         return match ($status) {
-            'pending', 'accepted', 'on_the_way', 'work_started' => 'Upcoming',
+            'pending', 'accepted', 'on_the_way', 'work_started', 'work_in_progress' => 'Upcoming',
             'completed' => 'Completed',
             'cancelled', 'rejected' => 'Cancelled',
             'expired' => 'Expired',
@@ -88,6 +93,7 @@ class BookingController extends Controller
             'completed' => 'completed',
             'cancelled', 'canceled' => 'cancelled',
             'expired' => 'expired',
+            'in_progress', 'in-progress' => 'in_progress',
             default => 'all',
         };
     }
@@ -95,11 +101,26 @@ class BookingController extends Controller
     private function bookingFilterStatuses(string $filter): ?array
     {
         return match ($filter) {
-            'upcoming' => ['pending', 'accepted', 'on_the_way', 'work_started'],
+            'upcoming' => ['pending', 'accepted', 'on_the_way', 'work_started', 'work_in_progress'],
+            'in_progress' => ['on_the_way', 'work_started', 'work_in_progress'],
             'completed' => ['completed'],
             'cancelled' => ['cancelled', 'rejected'],
             'expired' => ['expired'],
             default => null,
+        };
+    }
+
+    private function formatHistoryStatusLabel(string $status): string
+    {
+        $status = $this->normalizeBookingStatus($status);
+
+        return match ($status) {
+            'completed' => 'Completed',
+            'cancelled', 'rejected' => 'Cancelled',
+            'on_the_way', 'work_started', 'work_in_progress' => 'In Progress',
+            'pending', 'accepted' => 'Upcoming',
+            'expired' => 'Expired',
+            default => ucfirst(str_replace('_', ' ', $status)),
         };
     }
 
@@ -330,7 +351,7 @@ class BookingController extends Controller
             'can_cancel' => in_array($status, ['pending', 'accepted'], true),
             'can_rate' => $status === 'completed',
             'can_rebook' => $status === 'completed',
-            'can_track' => in_array($status, ['accepted', 'on_the_way', 'work_started'], true),
+            'can_track' => in_array($status, ['accepted', 'on_the_way', 'work_started', 'work_in_progress'], true),
         ];
     }
 
@@ -360,6 +381,7 @@ class BookingController extends Controller
                 'accepted_at' => $booking->accepted_at ? Carbon::parse($booking->accepted_at)->format('g:i A') : null,
                 'on_the_way_at' => $booking->on_the_way_at ? Carbon::parse($booking->on_the_way_at)->format('g:i A') : null,
                 'work_started_at' => $booking->work_started_at ? Carbon::parse($booking->work_started_at)->format('g:i A') : null,
+                'work_in_progress_at' => $booking->work_in_progress_at ? Carbon::parse($booking->work_in_progress_at)->format('g:i A') : null,
                 'completed_at' => $booking->completed_at ? Carbon::parse($booking->completed_at)->format('g:i A') : null,
             ],
         ];
@@ -371,7 +393,7 @@ class BookingController extends Controller
 
         $booking = Booking::where('id', $bookingId)
             ->where('customer_id', $customer->id)
-            ->whereIn('status', ['accepted', 'on_the_way', 'work_started', 'completed'])
+            ->whereIn('status', ['accepted', 'on_the_way', 'work_started', 'work_in_progress', 'completed'])
             ->with(['technician.serviceCategories', 'serviceCategory', 'district'])
             ->first();
 
@@ -392,6 +414,9 @@ class BookingController extends Controller
     private function expirePendingBookingsQuery($query)
     {
         return $query->where('status', 'pending')
+            ->where(function ($type) {
+                $type->whereNull('booking_type')->orWhere('booking_type', '!=', 'broadcast');
+            })
             ->whereNotNull('expires_at')
             ->where('expires_at', '<', Carbon::now())
             ->update(['status' => 'expired']);
@@ -424,7 +449,7 @@ class BookingController extends Controller
             return false;
         }
 
-        if ($booking->expires_at && Carbon::now()->greaterThan($booking->expires_at)) {
+        if ($booking->expires_at && !$booking->isBroadcast() && Carbon::now()->greaterThan($booking->expires_at)) {
             return false;
         }
 
@@ -440,11 +465,73 @@ class BookingController extends Controller
             return false;
         }
 
-        if ($booking->district_id && (int) $technician->district_id !== (int) $booking->district_id) {
+        if ($this->hasTechnicianRejectedBooking($technician, (int) $booking->id)) {
             return false;
         }
 
+        if (Schema::hasTable('booking_broadcast_notified')
+            && BookingBroadcastNotified::where('booking_id', $booking->id)->exists()) {
+            return BookingBroadcastNotified::where('booking_id', $booking->id)
+                ->where('technician_id', $technician->id)
+                ->exists();
+        }
+
         return true;
+    }
+
+    private function ensureBookingRejectionsTable(): void
+    {
+        if (Schema::hasTable('booking_rejections')) {
+            return;
+        }
+
+        Schema::create('booking_rejections', function ($table) {
+            $table->id();
+            $table->unsignedBigInteger('booking_id');
+            $table->unsignedBigInteger('technician_id');
+            $table->text('reason')->nullable();
+            $table->timestamps();
+            $table->unique(['booking_id', 'technician_id']);
+        });
+    }
+
+    private function hasTechnicianRejectedBooking(User $technician, int $bookingId): bool
+    {
+        $this->ensureBookingRejectionsTable();
+
+        return DB::table('booking_rejections')
+            ->where('booking_id', $bookingId)
+            ->where('technician_id', $technician->id)
+            ->exists();
+    }
+
+    private function technicianRejectedBookingIds(User $technician): array
+    {
+        $this->ensureBookingRejectionsTable();
+
+        return DB::table('booking_rejections')
+            ->where('technician_id', $technician->id)
+            ->pluck('booking_id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+    }
+
+    private function recordTechnicianBookingRejection(User $technician, Booking $booking, ?string $reason): void
+    {
+        $this->ensureBookingRejectionsTable();
+
+        $now = now();
+        DB::table('booking_rejections')->updateOrInsert(
+            [
+                'booking_id' => $booking->id,
+                'technician_id' => $technician->id,
+            ],
+            [
+                'reason' => $reason,
+                'updated_at' => $now,
+                'created_at' => $now,
+            ]
+        );
     }
 
     // Customer: Broadcast request to all technicians in selected category
@@ -458,12 +545,25 @@ class BookingController extends Controller
         'service_details' => 'required|string',
         'emergency_level' => 'required|in:medium,high,emergency',
         'additional_notes' => 'nullable|string',
+        'latitude' => 'nullable|numeric',
+        'longitude' => 'nullable|numeric',
     ]);
 
     $customer = $request->user();
-    $expiryMinutes = $this->bookingExpiryMinutes();
     $now = Carbon::now();
     $requestId = BookingReference::generateBroadcast($request->emergency_level);
+    $radiusService = app(BroadcastRadiusService::class);
+    $radiusService->ensureTables();
+    [$latitude, $longitude] = $radiusService->resolveCoordinates(
+        new Booking([
+            'address' => $request->address,
+            'city' => $request->city,
+        ]),
+        $customer,
+        $request->latitude ? (float) $request->latitude : null,
+        $request->longitude ? (float) $request->longitude : null,
+        $request->address . ', ' . $request->city
+    );
 
     $booking = Booking::create([
         'customer_id' => $customer->id,
@@ -481,79 +581,59 @@ class BookingController extends Controller
         'phone' => $request->phone ?? $customer->phone,
         'additional_notes' => $request->additional_notes,
         'booking_reference' => $requestId,
-        'expires_at' => $now->copy()->addMinutes($expiryMinutes),
+        'expires_at' => null,
+        'latitude' => $latitude,
+        'longitude' => $longitude,
+        'current_radius_km' => 20,
+        'last_expand_prompt_at' => $now,
     ]);
 
-    $onlineTechnicians = $this->matchingTechniciansQuery(
-        (int) $request->service_category_id,
-        $request->district_id ? (int) $request->district_id : null,
-        true
-    )->get(['id', 'name', 'currently_available']);
-
-    $technicianIds = $onlineTechnicians->pluck('id')->map(fn ($id) => (int) $id)->values()->all();
-
-    $pusherDispatched = false;
-    try {
-        event(new BroadcastServiceRequestCreated($booking->fresh(['serviceCategory', 'district', 'customer']), $technicianIds));
-        $pusherDispatched = true;
-    } catch (\Throwable $e) {
-        // Keep broadcast API working even when Pusher keys are not configured yet.
-        // #region agent log
-        @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'featured-broadcast', 'hypothesisId' => 'H-PUSHER', 'location' => 'BookingController::broadcastRequest', 'message' => 'pusher dispatch failed', 'data' => ['error' => $e->getMessage(), 'request_id' => $requestId], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
-        // #endregion
+    if ($latitude && $longitude && Schema::hasColumn('users', 'latitude')) {
+        $customer->forceFill(['latitude' => $latitude, 'longitude' => $longitude])->save();
     }
 
-    // #region agent log
-    @file_put_contents(base_path('debug-545283.log'), json_encode(['sessionId' => '545283', 'runId' => 'featured-broadcast', 'hypothesisId' => 'H-BCAST', 'location' => 'BookingController::broadcastRequest', 'message' => 'broadcast created', 'data' => ['booking_id' => $booking->id, 'request_id' => $requestId, 'online_technicians' => count($technicianIds), 'pusher_dispatched' => $pusherDispatched], 'timestamp' => round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
-    // #endregion
+    $technicians = collect();
+    if ($latitude && $longitude) {
+        $technicians = $radiusService->findTechniciansInRadius(
+            (int) $request->service_category_id,
+            $latitude,
+            $longitude,
+            20
+        );
+    }
 
+    $radiusService->notifyTechnicians(
+        $booking,
+        $technicians,
+        20,
+        $request->emergency_level === 'emergency' ? 'Emergency request' : 'New service request',
+        'Go to pending requests to accept or reject this job.'
+    );
+
+    if ($technicians->isEmpty()) {
+        $booking->update(['last_expand_prompt_at' => now()->subMinutes(2)]);
+    }
+
+    $payload = $radiusService->pushScreen($booking, 'broadcast_created');
     $booking->load(['serviceCategory', 'district']);
 
-    return response()->json([
-        'success' => true,
+    return response()->json(array_merge($payload, [
         'message' => 'Your request has been broadcast to available technicians.',
-        'request_id' => $requestId,
         'booking' => [
             'id' => $booking->id,
             'request_id' => $requestId,
             'customer_id' => $booking->customer_id,
-            'technician_id' => $booking->technician_id,
             'booking_type' => $booking->booking_type,
-            'service_category' => $booking->serviceCategory ? $booking->serviceCategory->name : null,
+            'service_category' => $booking->serviceCategory?->name,
             'service_category_id' => $booking->service_category_id,
-            'district' => $booking->district ? $booking->district->name : null,
-            'district_id' => $booking->district_id,
+            'district' => $booking->district?->name,
             'emergency_level' => $booking->emergency_level,
             'status' => $booking->status,
-            'service_date' => $booking->service_date,
-            'time_slot' => $booking->time_slot,
-            'service_details' => $booking->service_details,
             'address' => $booking->address,
             'city' => $booking->city,
-            'phone' => $booking->phone,
-            'additional_notes' => $booking->additional_notes,
             'booking_reference' => $booking->booking_reference,
-            'expires_at' => $booking->expires_at,
-            'created_at' => $booking->created_at,
-            'updated_at' => $booking->updated_at,
         ],
-        'technicians_notified' => count($technicianIds),
-        'notified_technicians' => $onlineTechnicians->map(fn ($tech) => [
-            'id' => $tech->id,
-            'name' => $tech->name,
-        ])->values(),
-        'pusher' => [
-            'dispatched' => $pusherDispatched,
-            'event' => 'broadcast.request.created',
-            'channels' => [
-                'private-service-category.' . (int) $booking->service_category_id,
-                'private-technician.{id} for each online matching technician',
-            ],
-            'note' => 'Add PUSHER_* keys in .env and set BROADCAST_DRIVER=pusher when ready.',
-        ],
-        'expires_at' => $booking->expires_at,
-        'expires_in_minutes' => $expiryMinutes,
-    ], 201);
+    ]), 201);
 }
 
     // Customer: Live broadcast status while waiting for first acceptance
@@ -571,48 +651,271 @@ class BookingController extends Controller
             return response()->json(['error' => 'Broadcast request not found'], 404);
         }
 
-        if ($booking->status === 'pending' && $booking->expires_at && Carbon::now()->greaterThan($booking->expires_at)) {
-            $booking->update(['status' => 'expired']);
-            $booking->refresh();
-        }
+        $radiusService = app(BroadcastRadiusService::class);
+        $radiusService->ensureTables();
+        $payload = $radiusService->screenPayload($booking, 'status');
 
-        $techniciansNotified = $this->matchingTechniciansQuery(
-            (int) $booking->service_category_id,
-            $booking->district_id ? (int) $booking->district_id : null,
-            true
-        )->count();
-
-        $response = [
-            'success' => true,
-            'booking_id' => $booking->id,
-            'request_id' => $booking->booking_reference,
-            'status' => $booking->status,
-            'expires_at' => $booking->expires_at,
-            'technicians_notified' => $techniciansNotified,
-            'service_category' => $booking->serviceCategory,
-            'district' => $booking->district,
-            'emergency_level' => $booking->emergency_level,
-            'address' => $booking->address,
-            'city' => $booking->city,
-            'service_details' => $booking->service_details,
-        ];
-
-        if ($booking->status === 'expired') {
-            $response['message'] = 'Your request is expired. Please broadcast a new request.';
-        } elseif ($booking->status === 'pending') {
-            $response['message'] = 'Broadcasting your request. Waiting for first technician acceptance.';
-            $response['remaining_seconds'] = max(0, Carbon::now()->diffInSeconds($booking->expires_at, false));
-        } elseif ($booking->status === 'accepted') {
-            $response['message'] = 'A technician accepted your request.';
-            $response['technician'] = $booking->technician;
-            $response['booking_reference'] = $booking->booking_reference;
-            $response['request_id'] = $booking->booking_reference;
+        if ($booking->status === 'accepted') {
+            $payload['message'] = 'A technician accepted your request.';
+            $payload['technician'] = $booking->technician;
         } elseif ($booking->status === 'cancelled') {
-            $response['message'] = 'You cancelled this request.';
+            $payload['message'] = 'You cancelled this request.';
+        } else {
+            $payload['message'] = 'Broadcasting your request. Waiting for first technician acceptance.';
         }
 
-        return response()->json($response);
+        return response()->json($payload);
     }
+
+    public function expandBroadcastRadius(Request $request, $bookingId)
+    {
+        $customer = $request->user();
+        $booking = Booking::where('id', $bookingId)
+            ->where('customer_id', $customer->id)
+            ->where('booking_type', 'broadcast')
+            ->where('status', 'pending')
+            ->whereNull('technician_id')
+            ->first();
+
+        if (!$booking) {
+            return response()->json(['error' => 'Broadcast request not found'], 404);
+        }
+
+        $radiusService = app(BroadcastRadiusService::class);
+        $radiusService->ensureTables();
+        $nextRadius = $radiusService->nextRadius((int) ($booking->current_radius_km ?: 20));
+        [$lat, $lng] = $radiusService->resolveCoordinates($booking, $customer);
+
+        $alreadyNotified = BookingBroadcastNotified::where('booking_id', $booking->id)->pluck('technician_id')->all();
+        $rejected = Schema::hasTable('booking_rejections')
+            ? DB::table('booking_rejections')->where('booking_id', $booking->id)->pluck('technician_id')->all()
+            : [];
+        $exclude = array_unique(array_map('intval', array_merge($alreadyNotified, $rejected)));
+
+        $newTechnicians = collect();
+        if ($lat && $lng) {
+            $newTechnicians = $radiusService->findTechniciansInRadius(
+                (int) $booking->service_category_id,
+                $lat,
+                $lng,
+                $nextRadius,
+                $exclude
+            );
+        }
+
+        $booking->update([
+            'current_radius_km' => $nextRadius,
+            'last_expand_prompt_at' => now(),
+        ]);
+
+        $radiusService->notifyTechnicians(
+            $booking,
+            $newTechnicians,
+            $nextRadius,
+            'New service request',
+            'Go to pending requests to accept or reject this job.'
+        );
+
+        $payload = $radiusService->pushScreen($booking->fresh(['serviceCategory']), 'radius_expanded');
+        $payload['message'] = $newTechnicians->isEmpty()
+            ? 'No new technicians found within ' . $nextRadius . ' km.'
+            : $newTechnicians->count() . ' technicians have been notified.';
+
+        return response()->json($payload);
+    }
+
+    public function selectBroadcastTechnician(Request $request, $bookingId)
+    {
+        $request->validate([
+            'technician_id' => 'required|integer',
+        ]);
+
+        $customer = $request->user();
+        $booking = Booking::where('id', $bookingId)
+            ->where('customer_id', $customer->id)
+            ->where('booking_type', 'broadcast')
+            ->where('status', 'pending')
+            ->whereNull('technician_id')
+            ->first();
+
+        if (!$booking) {
+            return response()->json(['error' => 'Broadcast request not found'], 404);
+        }
+
+        $radiusService = app(BroadcastRadiusService::class);
+        $radiusService->ensureTables();
+
+        $technician = User::where('id', $request->technician_id)
+            ->where('user_type', 'technician')
+            ->where('status', 'active')
+            ->first();
+
+        if (!$technician) {
+            return response()->json(['error' => 'Technician not found'], 404);
+        }
+
+        $remainingIds = $radiusService->remainingTechnicians($booking)->pluck('id')->map(fn ($id) => (int) $id)->all();
+        if (!in_array((int) $technician->id, $remainingIds, true)) {
+            return response()->json(['error' => 'This technician is not in the current broadcast list'], 404);
+        }
+
+        $offer = BookingIndividualOffer::create([
+            'booking_id' => $booking->id,
+            'technician_id' => $technician->id,
+            'status' => 'pending',
+        ]);
+
+        BookingBroadcastNotified::updateOrCreate(
+            ['booking_id' => $booking->id, 'technician_id' => $technician->id],
+            ['radius_km' => $booking->current_radius_km]
+        );
+
+        $radiusService->notifyUser(
+            $technician,
+            'A customer wants to select you individually',
+            $customer->name . ' wants to select you from your profile. Check the top of your pending requests.',
+            [
+                'booking_id' => $booking->id,
+                'request_id' => $booking->booking_reference,
+                'type' => 'individual_select',
+                'open' => 'pending_requests',
+            ],
+            'individual_select'
+        );
+
+        try {
+            event(new BroadcastServiceRequestCreated($booking->fresh(['serviceCategory', 'district', 'customer']), [(int) $technician->id]));
+        } catch (\Throwable $e) {
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Individual request sent to the technician.',
+            'offer_id' => $offer->id,
+            'technician_id' => $technician->id,
+        ]);
+    }
+
+    public function approveBroadcastTechnician(Request $request, $bookingId)
+    {
+        $request->validate([
+            'technician_id' => 'required|integer',
+        ]);
+
+        $customer = $request->user();
+        $booking = Booking::where('id', $bookingId)
+            ->where('customer_id', $customer->id)
+            ->where('booking_type', 'broadcast')
+            ->where('status', 'pending')
+            ->first();
+
+        if (!$booking) {
+            return response()->json(['error' => 'Broadcast request not found'], 404);
+        }
+
+        $offer = BookingIndividualOffer::where('booking_id', $booking->id)
+            ->where('technician_id', $request->technician_id)
+            ->where('status', 'technician_accepted')
+            ->latest()
+            ->first();
+
+        if (!$offer) {
+            return response()->json(['error' => 'No technician acceptance waiting for your approval'], 404);
+        }
+
+        $booking->update([
+            'technician_id' => $offer->technician_id,
+            'status' => 'accepted',
+            'accepted_at' => now(),
+            'expires_at' => null,
+        ]);
+        $offer->update(['status' => 'customer_approved']);
+
+        $technician = User::find($offer->technician_id);
+        if ($technician) {
+            app(BroadcastRadiusService::class)->notifyUser(
+                $technician,
+                'The customer accepted you',
+                'The job is now locked to you.',
+                ['booking_id' => $booking->id, 'type' => 'individual_approved']
+            );
+        }
+
+        app(BroadcastRadiusService::class)->notifyUser(
+            $customer,
+            'Your request has been accepted',
+            ($technician->name ?? 'Technician') . ' accepted your request. The job is now locked.',
+            [
+                'booking_id' => $booking->id,
+                'technician_id' => $offer->technician_id,
+                'type' => 'broadcast_accepted',
+            ],
+            'broadcast_accepted'
+        );
+
+        $payload = app(BroadcastRadiusService::class)->pushScreen($booking->fresh(['technician', 'serviceCategory']), 'locked');
+
+        return response()->json(array_merge($payload, [
+            'message' => 'Technician approved. The broadcast request is now locked.',
+        ]));
+    }
+
+    public function declineBroadcastTechnician(Request $request, $bookingId)
+    {
+        $request->validate([
+            'technician_id' => 'required|integer',
+        ]);
+
+        $customer = $request->user();
+        $booking = Booking::where('id', $bookingId)
+            ->where('customer_id', $customer->id)
+            ->where('booking_type', 'broadcast')
+            ->where('status', 'pending')
+            ->first();
+
+        if (!$booking) {
+            return response()->json(['error' => 'Broadcast request not found'], 404);
+        }
+
+        $offer = BookingIndividualOffer::where('booking_id', $booking->id)
+            ->where('technician_id', $request->technician_id)
+            ->where('status', 'technician_accepted')
+            ->latest()
+            ->first();
+
+        if (!$offer) {
+            return response()->json(['error' => 'No technician acceptance waiting for your approval'], 404);
+        }
+
+        $offer->update(['status' => 'customer_declined']);
+
+        $technician = User::find($offer->technician_id);
+        if ($technician) {
+            app(BroadcastRadiusService::class)->notifyUser(
+                $technician,
+                'The customer did not accept you',
+                $customer->name . ' declined your acceptance. The broadcast request is still open.',
+                [
+                    'booking_id' => $booking->id,
+                    'technician_id' => $technician->id,
+                    'request_id' => $booking->booking_reference,
+                    'type' => 'individual_declined',
+                    'open' => 'pending_requests',
+                ],
+                'individual_declined'
+            );
+        }
+
+        // #region agent log
+        @file_put_contents(base_path('debug-1d5da7.log'), json_encode(['sessionId' => '1d5da7', 'runId' => 'post-fix', 'hypothesisId' => 'D', 'location' => 'BookingController::declineBroadcastTechnician', 'message' => 'customer declined individual acceptance', 'data' => ['booking_id' => $booking->id, 'technician_id' => $offer->technician_id, 'technician_found' => (bool) $technician, 'notification_type' => 'individual_declined'], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
+        $payload = app(BroadcastRadiusService::class)->pushScreen($booking->fresh(['serviceCategory']), 'customer_declined_technician');
+        $payload['message'] = 'You declined this technician. The broadcast request is still open.';
+
+        return response()->json($payload);
+    }
+
 
     // Customer: Book a technician
     public function bookTechnician(Request $request)
@@ -757,7 +1060,7 @@ class BookingController extends Controller
 
         $bookings = Booking::query()
             ->where('technician_id', $technician->id)
-            ->whereIn('status', ['accepted', 'on_the_way', 'work_started'])
+            ->whereIn('status', ['accepted', 'on_the_way', 'work_started', 'work_in_progress'])
             ->with([
                 'customer' => function ($query) {
                     $query->select('id', 'name', 'photo', 'is_verified', 'phone');
@@ -766,7 +1069,7 @@ class BookingController extends Controller
                 'district:id,name',
                 'technician.serviceCategories',
             ])
-            ->orderByRaw("CASE status WHEN 'on_the_way' THEN 1 WHEN 'work_started' THEN 2 WHEN 'accepted' THEN 3 ELSE 4 END")
+            ->orderByRaw("CASE status WHEN 'on_the_way' THEN 1 WHEN 'work_started' THEN 2 WHEN 'work_in_progress' THEN 3 WHEN 'accepted' THEN 4 ELSE 5 END")
             ->orderBy('service_date')
             ->orderBy('time_slot')
             ->paginate($perPage)
@@ -802,11 +1105,31 @@ class BookingController extends Controller
             ], 403);
         }
 
-        $this->deleteExpiredBroadcastRequests();
+        app(BroadcastRadiusService::class)->ensureTables();
+
+        $filter = strtolower(trim((string) ($request->input('filter') ?? $request->input('type') ?? 'all')));
+        if (!in_array($filter, ['all', 'now', 'later', 'emergency'], true)) {
+            $filter = 'all';
+        }
 
         $perPage = $this->technicianHomePerPage($request);
+        $baseQuery = $this->technicianPendingBookingsQuery($technician);
 
-        $bookings = $this->technicianPendingBookingsQuery($technician)
+        $filterCounts = [
+            'all' => (clone $baseQuery)->count(),
+            'now' => $this->applyPendingRequestTypeFilter(clone $baseQuery, 'now')->count(),
+            'later' => $this->applyPendingRequestTypeFilter(clone $baseQuery, 'later')->count(),
+            'emergency' => $this->applyPendingRequestTypeFilter(clone $baseQuery, 'emergency')->count(),
+        ];
+
+        $bookings = $this->applyPendingRequestTypeFilter(clone $baseQuery, $filter)
+            ->orderByRaw("CASE WHEN EXISTS (
+                SELECT 1 FROM booking_individual_offers o
+                WHERE o.booking_id = bookings.id
+                  AND o.technician_id = ?
+                  AND o.status IN ('pending','technician_accepted')
+            ) THEN 0 ELSE 1 END", [$technician->id])
+            ->orderByRaw("CASE WHEN emergency_level = 'emergency' THEN 0 WHEN emergency_level = 'high' THEN 1 ELSE 2 END")
             ->latest()
             ->paginate($perPage)
             ->appends($request->query());
@@ -820,7 +1143,10 @@ class BookingController extends Controller
             'message' => $requests->isEmpty()
                 ? 'No pending requests right now.'
                 : 'Pending requests retrieved successfully.',
-            'new_count' => $bookings->total(),
+            'filter' => $filter,
+            'filters' => $filterCounts,
+            'new_count' => $filterCounts['all'],
+            'badge_count' => $filterCounts['emergency'] + $filterCounts['now'],
             'data' => [
                 'current_page' => $bookings->currentPage(),
                 'per_page' => $bookings->perPage(),
@@ -831,45 +1157,105 @@ class BookingController extends Controller
         ]);
     }
 
-    public function getBookingRequests(Request $request)
+    public function technicianBookingHistory(Request $request)
     {
-    $technician = Auth::user();
+        $technician = $request->user();
 
         if ($technician->user_type !== 'technician') {
-        return response()->json([
-            'success' => false,
-            'message' => 'Only technicians can view service requests.'
-        ], 403);
+            return response()->json([
+                'success' => false,
+                'message' => 'Only technicians can view booking history.',
+            ], 403);
         }
 
-        $status = $request->get('status', 'pending');
+        $filter = $this->resolveBookingsFilter($request);
+        $filterStatuses = $this->bookingFilterStatuses($filter);
+        $perPage = $this->technicianHomePerPage($request);
 
-        $this->deleteExpiredBroadcastRequests();
+        $baseQuery = Booking::query()->where('technician_id', $technician->id);
 
-        $bookings = $this->technicianInboxQuery($technician)
-            ->when($status && $status !== 'all', function ($query) use ($status) {
-                $query->where('status', $status);
+        $upcomingCount = (clone $baseQuery)->whereIn('status', ['pending', 'accepted', 'on_the_way', 'work_started', 'work_in_progress'])->count();
+
+        $bookings = (clone $baseQuery)
+            ->when($filterStatuses !== null, function ($query) use ($filterStatuses) {
+                return $query->whereIn('status', $filterStatuses);
             })
+            ->with([
+                'customer' => function ($query) {
+                    $query->select('id', 'name', 'photo', 'is_verified', 'phone');
+                },
+                'serviceCategory:id,name,slug,icon',
+                'district:id,name',
+            ])
             ->latest()
-            ->paginate(20);
+            ->paginate($perPage)
+            ->appends($request->query());
 
-    if ($bookings->total() == 0) {
+        $history = collect($bookings->items())->map(function (Booking $booking) {
+            return $this->formatTechnicianHistoryCard($booking);
+        })->values();
+
         return response()->json([
             'success' => true,
-            'message' => 'No service requests are currently available.',
-            'data' => []
-        ], 200);
+            'message' => $history->isEmpty()
+                ? 'No bookings found.'
+                : 'Booking history retrieved successfully.',
+            'filter' => $filter === 'upcoming' ? 'pending' : $filter,
+            'filters' => [
+                'all' => (clone $baseQuery)->count(),
+                'pending' => $upcomingCount,
+                'upcoming' => $upcomingCount,
+                'completed' => (clone $baseQuery)->where('status', 'completed')->count(),
+                'cancelled' => (clone $baseQuery)->whereIn('status', ['cancelled', 'rejected'])->count(),
+            ],
+            'data' => [
+                'current_page' => $bookings->currentPage(),
+                'per_page' => $bookings->perPage(),
+                'total' => $bookings->total(),
+                'last_page' => $bookings->lastPage(),
+                'bookings' => $history,
+            ],
+        ]);
     }
 
-    // Transform data to match the required response format
-    $transformedData = $this->transformBookingRequests($bookings, $technician);
+    private function formatTechnicianHistoryCard(Booking $booking): array
+    {
+        $status = $this->normalizeBookingStatus($booking->status);
+        $statusLabel = $this->formatHistoryStatusLabel($status);
+        $customerName = $booking->customer->name ?? 'Unknown Customer';
+        $location = $this->formatJobAddress($booking);
 
-    return response()->json([
-        'success' => true,
-        'message' => 'Service requests retrieved successfully.',
-        'data' => $transformedData
-    ], 200);
-}
+        return [
+            'id' => $booking->id,
+            'booking_reference' => $booking->booking_reference,
+            'booking_type' => $booking->booking_type ?? 'direct',
+            'customer_name' => $customerName,
+            'customer_initials' => $this->customerInitials($customerName),
+            'customer_photo' => $this->photoUrl($booking->customer->photo ?? null),
+            'is_verified' => (bool) ($booking->customer->is_verified ?? false),
+            'service_category' => $this->resolveJobServiceCategoryName($booking),
+            'service_details' => $booking->service_details,
+            'location' => $location,
+            'address' => $booking->address,
+            'city' => $booking->city,
+            'date' => $this->formatJobDateLabel($booking),
+            'time' => $this->formatTimeSlot12h($booking->time_slot),
+            'scheduled_at' => $this->formatScheduledLabel($booking),
+            'status' => $status,
+            'status_label' => $statusLabel,
+            'can_track' => in_array($status, ['accepted', 'on_the_way', 'work_started', 'work_in_progress'], true),
+            'can_view_receipt' => $status === 'completed',
+            'action' => $status === 'completed'
+                ? 'view_receipt'
+                : (in_array($status, ['cancelled', 'rejected'], true) ? 'view_details' : 'track_progress'),
+            'track_endpoint' => '/api/bookings/' . $booking->id . '/status',
+        ];
+    }
+
+    public function getBookingRequests(Request $request)
+    {
+        return $this->pendingRequests($request);
+    }
 
 /**
  * Transform booking requests to match the required response format
@@ -973,18 +1359,19 @@ private function technicianHomePerPage(Request $request): int
 
 private function deleteExpiredBroadcastRequests(): void
 {
-    Booking::where('booking_type', 'broadcast')
-        ->where('status', 'pending')
-        ->whereNotNull('expires_at')
-        ->where('expires_at', '<', now())
-        ->delete();
+    // Broadcast requests stay open until the customer cancels.
 }
 
 private function technicianInboxQuery(User $technician)
 {
     $categoryIds = $technician->serviceCategories()->pluck('service_categories.id');
 
+    $rejectedIds = $this->technicianRejectedBookingIds($technician);
+
     return Booking::query()
+        ->when(!empty($rejectedIds), function ($query) use ($rejectedIds) {
+            $query->whereNotIn('id', $rejectedIds);
+        })
         ->where(function ($query) use ($technician, $categoryIds) {
             $query->where(function ($assigned) use ($technician) {
                 $assigned->where('technician_id', $technician->id)
@@ -1009,11 +1396,7 @@ private function technicianInboxQuery(User $technician)
                         function ($q) {
                             $q->whereRaw('1 = 0');
                         }
-                    )
-                    ->where(function ($district) use ($technician) {
-                        $district->whereNull('district_id')
-                            ->orWhere('district_id', $technician->district_id);
-                    });
+                    );
             });
         })
         ->with([
@@ -1030,8 +1413,13 @@ private function technicianPendingBookingsQuery(User $technician)
 {
     $categoryIds = $technician->serviceCategories()->pluck('service_categories.id');
 
+    $rejectedIds = $this->technicianRejectedBookingIds($technician);
+
     return Booking::query()
         ->where('status', 'pending')
+        ->when(!empty($rejectedIds), function ($query) use ($rejectedIds) {
+            $query->whereNotIn('id', $rejectedIds);
+        })
         ->where(function ($query) use ($technician, $categoryIds) {
             $query->where(function ($direct) use ($technician) {
                 $direct->where('technician_id', $technician->id)
@@ -1047,10 +1435,6 @@ private function technicianPendingBookingsQuery(User $technician)
             ->orWhere(function ($broadcast) use ($technician, $categoryIds) {
                 $broadcast->where('booking_type', 'broadcast')
                     ->whereNull('technician_id')
-                    ->where(function ($expiry) {
-                        $expiry->whereNull('expires_at')
-                            ->orWhere('expires_at', '>=', now());
-                    })
                     ->when(
                         $categoryIds->isNotEmpty(),
                         function ($q) use ($categoryIds) {
@@ -1060,11 +1444,19 @@ private function technicianPendingBookingsQuery(User $technician)
                             $q->whereRaw('1 = 0');
                         }
                     )
-                    ->where(function ($district) use ($technician) {
-                        $district->whereNull('district_id');
-                        if ($technician->district_id) {
-                            $district->orWhere('district_id', $technician->district_id);
-                        }
+                    ->when(Schema::hasTable('booking_broadcast_notified'), function ($q) use ($technician) {
+                        $q->where(function ($notified) use ($technician) {
+                            $notified->whereNotExists(function ($legacy) {
+                                $legacy->select(DB::raw(1))
+                                    ->from('booking_broadcast_notified as n0')
+                                    ->whereColumn('n0.booking_id', 'bookings.id');
+                            })->orWhereExists(function ($mine) use ($technician) {
+                                $mine->select(DB::raw(1))
+                                    ->from('booking_broadcast_notified as n1')
+                                    ->whereColumn('n1.booking_id', 'bookings.id')
+                                    ->where('n1.technician_id', $technician->id);
+                            });
+                        });
                     });
             });
         })
@@ -1110,38 +1502,62 @@ private function formatTechnicianActiveJobCard(Booking $booking): array
 private function formatTechnicianPendingRequestCard(Booking $booking, User $technician): array
 {
     $customerName = $booking->customer->name ?? 'Unknown Customer';
-    $distance = $this->calculateDistance(
+    $isDirect = ($booking->booking_type ?? 'direct') !== 'broadcast';
+    $individual = Schema::hasTable('booking_individual_offers')
+        ? BookingIndividualOffer::where('booking_id', $booking->id)
+            ->where('technician_id', $technician->id)
+            ->whereIn('status', ['pending', 'technician_accepted'])
+            ->latest()
+            ->first()
+        : null;
+    $requestType = $this->resolvePendingRequestType($booking);
+    $destLat = $booking->latitude ?? $booking->customer->latitude ?? null;
+    $destLng = $booking->longitude ?? $booking->customer->longitude ?? null;
+    $distanceKm = $this->googleMapsDistanceKm(
         $technician->latitude,
         $technician->longitude,
-        $booking->customer->latitude ?? null,
-        $booking->customer->longitude ?? null
+        $destLat,
+        $destLng
     );
-    $isDirect = ($booking->booking_type ?? 'direct') !== 'broadcast';
+    $customerPhoto = $this->photoUrl($booking->customer->photo ?? null);
+    $isVerified = (bool) ($booking->customer->is_verified ?? false);
 
     return [
         'id' => $booking->id,
         'booking_type' => $isDirect ? 'direct' : 'broadcast',
-        'request_source' => $isDirect ? 'assigned_to_you' : 'service_category',
+        'request_source' => $individual ? 'individual_select' : ($isDirect ? 'assigned_to_you' : 'service_category'),
+        'is_individual_select' => (bool) $individual,
+        'request_type' => $requestType,
+        'request_type_label' => match ($requestType) {
+            'emergency' => 'Emergency',
+            'now' => 'Now',
+            default => 'Later',
+        },
+        'is_emergency' => $requestType === 'emergency',
         'customer_name' => $customerName,
         'customer_initials' => $this->customerInitials($customerName),
-        'customer_photo' => $this->photoUrl($booking->customer->photo ?? null),
-        'is_verified' => (bool) ($booking->customer->is_verified ?? false),
+        'customer_image' => $customerPhoto,
+        'customer_photo' => $customerPhoto,
+        'is_verified' => $isVerified,
+        'verified_status' => $isVerified ? 'Verified Customer' : 'Customer',
         'service_category_id' => $booking->service_category_id,
         'service_category' => $this->resolveJobServiceCategoryName($booking),
         'service_details' => $booking->service_details,
         'description' => $booking->service_details ?? $booking->additional_notes ?? null,
-        'distance' => $distance ? $distance . ' km' : null,
+        'distance' => $distanceKm !== null ? $distanceKm . ' km' : null,
+        'distance_km' => $distanceKm,
         'address' => $this->formatJobAddress($booking),
         'requested_ago' => $this->formatRequestedAgo($booking->created_at),
         'date' => $this->formatJobDateLabel($booking),
         'time' => $this->formatTimeSlot12h($booking->time_slot),
+        'scheduled_at' => $this->formatScheduledLabel($booking),
         'priority' => ucfirst($booking->emergency_level ?? 'low'),
         'expires_at' => $this->getExpiryTime($booking),
         'status' => $this->normalizeBookingStatus($booking->status),
         'can_accept' => true,
-        'can_reject' => $isDirect,
+        'can_reject' => true,
         'accept_endpoint' => '/api/bookings/' . $booking->id . '/accept',
-        'reject_endpoint' => $isDirect ? '/api/bookings/' . $booking->id . '/reject' : null,
+        'reject_endpoint' => '/api/bookings/' . $booking->id . '/reject',
     ];
 }
 
@@ -1251,6 +1667,7 @@ private function technicianStatusBadge(string $status): string
         'accepted' => 'Accepted',
         'on_the_way' => 'On the Way',
         'work_started' => 'Work Started',
+        'work_in_progress' => 'Work In Progress',
         'pending' => 'Pending',
         'completed' => 'Completed',
         default => ucfirst(str_replace('_', ' ', $status)),
@@ -1262,9 +1679,94 @@ private function nextJobStatus(string $status): ?array
     return match ($this->normalizeBookingStatus($status)) {
         'accepted' => ['status' => 'on_the_way', 'label' => 'On the Way'],
         'on_the_way' => ['status' => 'work_started', 'label' => 'Work Started'],
-        'work_started' => ['status' => 'completed', 'label' => 'Completed'],
+        'work_started' => ['status' => 'work_in_progress', 'label' => 'Work In Progress'],
+        'work_in_progress' => ['status' => 'completed', 'label' => 'Completed'],
         default => null,
     };
+}
+
+private function resolvePendingRequestType(Booking $booking): string
+{
+    if (strtolower((string) ($booking->emergency_level ?? '')) === 'emergency') {
+        return 'emergency';
+    }
+
+    if ($booking->isBroadcast()) {
+        return 'now';
+    }
+
+    $date = $booking->service_date ?: $booking->created_at;
+    if ($date && Carbon::parse($date)->isToday()) {
+        return 'now';
+    }
+
+    return 'later';
+}
+
+private function applyPendingRequestTypeFilter($query, string $filter)
+{
+    if ($filter === 'all') {
+        return $query;
+    }
+
+    if ($filter === 'emergency') {
+        return $query->where('emergency_level', 'emergency');
+    }
+
+    $query->where(function ($q) {
+        $q->whereNull('emergency_level')
+            ->orWhere('emergency_level', '!=', 'emergency');
+    });
+
+    if ($filter === 'now') {
+        return $query->where(function ($q) {
+            $q->where('booking_type', 'broadcast')
+                ->orWhereDate('service_date', Carbon::today());
+        });
+    }
+
+    return $query->where(function ($q) {
+        $q->whereNull('booking_type')
+            ->orWhere('booking_type', '!=', 'broadcast');
+    })->whereDate('service_date', '>', Carbon::today());
+}
+
+private function googleMapsDistanceKm($lat1, $lon1, $lat2, $lon2): ?float
+{
+    $fallback = $this->calculateDistance($lat1, $lon1, $lat2, $lon2);
+    $key = config('services.google_maps.key');
+
+    if (!$key || $fallback === null) {
+        return $fallback;
+    }
+
+    $cacheKey = 'gmaps_dist_' . implode('_', [
+        round((float) $lat1, 5),
+        round((float) $lon1, 5),
+        round((float) $lat2, 5),
+        round((float) $lon2, 5),
+    ]);
+
+    try {
+        $meters = Cache::remember($cacheKey, 600, function () use ($key, $lat1, $lon1, $lat2, $lon2) {
+            $response = Http::timeout(8)->get('https://maps.googleapis.com/maps/api/distancematrix/json', [
+                'origins' => $lat1 . ',' . $lon1,
+                'destinations' => $lat2 . ',' . $lon2,
+                'units' => 'metric',
+                'key' => $key,
+            ]);
+
+            return $response->json('rows.0.elements.0.distance.value');
+        });
+
+        if ($meters !== null && $meters !== false) {
+            return round(((float) $meters) / 1000, 1);
+        }
+    } catch (\Throwable $e) {
+        // fall back to coordinate distance
+    }
+
+    return $fallback;
 }
 
 /**
@@ -1377,7 +1879,7 @@ private function technicianHasScheduledSlotConflict(User $technician, Booking $b
         ->where('id', '!=', $booking->id)
         ->whereDate('service_date', $serviceDate)
         ->whereRaw('TIME(time_slot) = ?', [$timeSlot])
-        ->whereIn('status', ['accepted', 'on_the_way', 'work_started'])
+        ->whereIn('status', ['accepted', 'on_the_way', 'work_started', 'work_in_progress'])
         ->where(function ($query) {
             $query->whereNull('booking_type')
                 ->orWhere('booking_type', 'direct');
@@ -1394,6 +1896,8 @@ private function technicianHasScheduledSlotConflict(User $technician, Booking $b
             return response()->json(['error' => 'Only technicians can accept bookings'], 403);
         }
 
+        app(BroadcastRadiusService::class)->ensureTables();
+
     $booking = DB::transaction(function () use ($bookingId, $technician) {
         $booking = Booking::where('id', $bookingId)->lockForUpdate()->first();
 
@@ -1403,6 +1907,9 @@ private function technicianHasScheduledSlotConflict(User $technician, Booking $b
 
         if ($booking->isBroadcast()) {
             if (!$this->technicianCanViewBroadcast($technician, $booking)) {
+                return 'forbidden';
+            }
+            if ($this->hasTechnicianRejectedBooking($technician, (int) $booking->id)) {
                 return 'forbidden';
             }
         } elseif ((int) $booking->technician_id !== (int) $technician->id) {
@@ -1417,7 +1924,7 @@ private function technicianHasScheduledSlotConflict(User $technician, Booking $b
             return 'processed';
         }
 
-        if ($booking->expires_at && Carbon::now()->greaterThan($booking->expires_at)) {
+        if ($booking->expires_at && !$booking->isBroadcast() && Carbon::now()->greaterThan($booking->expires_at)) {
             $booking->update(['status' => 'expired']);
             return 'expired';
         }
@@ -1428,6 +1935,19 @@ private function technicianHasScheduledSlotConflict(User $technician, Booking $b
 
         if ($this->technicianHasScheduledSlotConflict($technician, $booking)) {
             return 'slot_unavailable';
+        }
+
+        if ($booking->isBroadcast()) {
+            $offer = BookingIndividualOffer::where('booking_id', $booking->id)
+                ->where('technician_id', $technician->id)
+                ->where('status', 'pending')
+                ->latest()
+                ->first();
+
+            if ($offer) {
+                $offer->update(['status' => 'technician_accepted']);
+                return ['awaiting_customer_approval', $booking->fresh()];
+            }
         }
 
         $referenceCode = $booking->booking_reference ?: BookingReference::generate();
@@ -1479,8 +1999,58 @@ private function technicianHasScheduledSlotConflict(User $technician, Booking $b
         ], 400);
     }
 
+    if (is_array($booking) && ($booking[0] ?? null) === 'awaiting_customer_approval') {
+        $offerBooking = $booking[1];
+        $customer = $offerBooking->customer;
+        if ($customer) {
+            app(BroadcastRadiusService::class)->notifyUser(
+                $customer,
+                ($technician->name ?? 'Technician') . ' is accepting your request',
+                'Do you want to approve this technician?',
+                [
+                    'booking_id' => $offerBooking->id,
+                    'technician_id' => $technician->id,
+                    'type' => 'individual_acceptance',
+                    'show_approval_popup' => true,
+                ],
+                'individual_acceptance'
+            );
+        }
+        app(BroadcastRadiusService::class)->pushScreen($offerBooking, 'technician_awaiting_approval');
+
+        return response()->json([
+            'success' => true,
+            'awaiting_customer_approval' => true,
+            'message' => 'An approval popup has been sent to the customer.',
+            'booking_id' => $offerBooking->id,
+        ]);
+    }
+
+        $booking->load(['customer', 'technician', 'serviceCategory', 'district']);
+
         // Send notification to customer
         $this->notifyCustomer($booking->customer, $booking, 'accepted');
+        if ($booking->isBroadcast() && $booking->customer) {
+            app(BroadcastRadiusService::class)->notifyUser(
+                $booking->customer,
+                'Your request has been accepted',
+                ($booking->technician->name ?? 'Technician') . ' accepted your request.',
+                [
+                    'booking_id' => $booking->id,
+                    'technician_id' => $booking->technician_id,
+                    'type' => 'broadcast_accepted',
+                ],
+                'broadcast_accepted'
+            );
+        }
+
+        // #region agent log
+        @file_put_contents(base_path('debug-1d5da7.log'), json_encode(['sessionId' => '1d5da7', 'runId' => 'pre-fix', 'hypothesisId' => 'E', 'location' => 'BookingController::acceptBooking', 'message' => 'broadcast locked by technician accept', 'data' => ['booking_id' => $booking->id, 'technician_id' => $booking->technician_id, 'is_broadcast' => $booking->isBroadcast()], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+        // #endregion
+
+    if ($booking->isBroadcast()) {
+        app(BroadcastRadiusService::class)->pushScreen($booking, 'locked');
+    }
 
     $booking->load(['customer', 'technician', 'serviceCategory', 'district']);
 
@@ -1538,6 +2108,7 @@ private function transformAcceptedBooking($booking)
             'accepted_at' => $booking->accepted_at ? Carbon::parse($booking->accepted_at)->format('g:i A') : null,
             'on_the_way_at' => $booking->on_the_way_at ? Carbon::parse($booking->on_the_way_at)->format('g:i A') : null,
             'work_started_at' => $booking->work_started_at ? Carbon::parse($booking->work_started_at)->format('g:i A') : null,
+            'work_in_progress_at' => $booking->work_in_progress_at ? Carbon::parse($booking->work_in_progress_at)->format('g:i A') : null,
             'completed_at' => $booking->completed_at ? Carbon::parse($booking->completed_at)->format('g:i A') : null,
         ],
         'booking_details' => [
@@ -1554,7 +2125,7 @@ private function transformAcceptedBooking($booking)
     ];
 }
 
-    // Technician: Reject a booking request (direct bookings only)
+    // Technician: Reject a booking request (direct + broadcast)
     public function rejectBooking(Request $request, $bookingId)
     {
         $technician = $request->user();
@@ -1567,12 +2138,84 @@ private function transformAcceptedBooking($booking)
             'reason' => 'nullable|string',
         ]);
 
-        $booking = Booking::where('id', $bookingId)
-            ->where('technician_id', $technician->id)
-            ->where('booking_type', 'direct')
-            ->first();
+        $booking = Booking::where('id', $bookingId)->first();
 
         if (!$booking) {
+            return response()->json(['error' => 'Booking not found for this technician'], 404);
+        }
+
+        if ($booking->isBroadcast()) {
+            $hasMatchingCategory = $booking->service_category_id
+                && $technician->serviceCategories()
+                    ->where('service_categories.id', $booking->service_category_id)
+                    ->exists();
+
+            if (!$hasMatchingCategory) {
+                return response()->json(['error' => 'Booking not found for this technician'], 404);
+            }
+
+            if ($booking->status === 'expired') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'This request has already expired.',
+                ], 410);
+            }
+
+            if ($booking->status !== 'pending' || $booking->technician_id) {
+                return response()->json([
+                    'error' => 'Booking already processed',
+                    'status' => $booking->status,
+                ], 409);
+            }
+
+            $this->recordTechnicianBookingRejection(
+                $technician,
+                $booking,
+                $request->reason ?? 'Rejected by technician'
+            );
+
+            if (Schema::hasTable('booking_individual_offers')) {
+                $hadIndividual = BookingIndividualOffer::where('booking_id', $booking->id)
+                    ->where('technician_id', $technician->id)
+                    ->whereIn('status', ['pending', 'technician_accepted'])
+                    ->exists();
+
+                BookingIndividualOffer::where('booking_id', $booking->id)
+                    ->where('technician_id', $technician->id)
+                    ->whereIn('status', ['pending', 'technician_accepted'])
+                    ->update(['status' => 'technician_rejected']);
+            } else {
+                $hadIndividual = false;
+            }
+
+            $customer = $booking->customer;
+            if ($customer && $hadIndividual) {
+                app(BroadcastRadiusService::class)->notifyUser(
+                    $customer,
+                    'A technician rejected your request',
+                    ($technician->name ?? 'Technician') . ' rejected your individual request. The broadcast is still open.',
+                    [
+                        'booking_id' => $booking->id,
+                        'technician_id' => $technician->id,
+                        'type' => 'individual_rejected',
+                    ],
+                    'individual_rejected'
+                );
+            }
+
+            // #region agent log
+            @file_put_contents(base_path('debug-1d5da7.log'), json_encode(['sessionId' => '1d5da7', 'runId' => 'pre-fix', 'hypothesisId' => 'D', 'location' => 'BookingController::rejectBooking', 'message' => 'broadcast reject', 'data' => ['booking_id' => $booking->id, 'technician_id' => $technician->id, 'had_individual' => (bool) $hadIndividual, 'customer_notified' => (bool) ($customer && $hadIndividual)], 'timestamp' => (int) round(microtime(true) * 1000)]) . "\n", FILE_APPEND);
+            // #endregion
+
+            app(BroadcastRadiusService::class)->pushScreen($booking, 'technician_rejected');
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Booking rejected',
+            ]);
+        }
+
+        if ((int) $booking->technician_id !== (int) $technician->id) {
             return response()->json(['error' => 'Booking not found for this technician'], 404);
         }
 
@@ -1607,6 +2250,10 @@ private function transformAcceptedBooking($booking)
     // Customer: Get my bookings
     public function myBookings(Request $request)
     {
+        if ($request->user()?->user_type === 'technician') {
+            return $this->technicianBookingHistory($request);
+        }
+
         $customer = $request->user();
 
         $this->expirePendingBookingsQuery(
@@ -1626,7 +2273,7 @@ private function transformAcceptedBooking($booking)
 
         $filterCounts = [
             'all' => (clone $baseQuery)->count(),
-            'upcoming' => (clone $baseQuery)->whereIn('status', ['pending', 'accepted', 'on_the_way', 'work_started'])->count(),
+            'upcoming' => (clone $baseQuery)->whereIn('status', ['pending', 'accepted', 'on_the_way', 'work_started', 'work_in_progress'])->count(),
             'completed' => (clone $baseQuery)->where('status', 'completed')->count(),
             'cancelled' => (clone $baseQuery)->whereIn('status', ['cancelled', 'rejected'])->count(),
         ];
@@ -1707,6 +2354,21 @@ private function transformAcceptedBooking($booking)
         $this->notifyTechnician($booking->technician, $booking, 'cancelled');
         }
 
+        if ($booking->isBroadcast()) {
+            $radiusService = app(BroadcastRadiusService::class);
+            $radiusService->ensureTables();
+            $notifiedIds = BookingBroadcastNotified::where('booking_id', $booking->id)->pluck('technician_id');
+            foreach (User::whereIn('id', $notifiedIds)->get() as $tech) {
+                $radiusService->notifyUser(
+                    $tech,
+                    'Request cancelled',
+                    'The customer cancelled the broadcast request.',
+                    ['booking_id' => $booking->id, 'type' => 'broadcast_cancelled']
+                );
+            }
+            $radiusService->pushScreen($booking, 'cancelled');
+        }
+
         return response()->json([
             'success' => true,
             'message' => $booking->isBroadcast()
@@ -1727,7 +2389,7 @@ private function transformAcceptedBooking($booking)
         $booking = Booking::with('customer')
             ->where('id', $bookingId)
             ->where('technician_id', $technician->id)
-            ->whereIn('status', ['accepted', 'on_the_way', 'work_started'])
+            ->whereIn('status', ['accepted', 'on_the_way', 'work_started', 'work_in_progress'])
             ->first();
 
         if (!$booking) {
@@ -1755,7 +2417,7 @@ private function transformAcceptedBooking($booking)
         $booking = Booking::with('customer')
             ->where('id', $bookingId)
             ->where('technician_id', $technician->id)
-            ->whereIn('status', ['accepted', 'on_the_way', 'work_started'])
+            ->whereIn('status', ['accepted', 'on_the_way', 'work_started', 'work_in_progress'])
             ->first();
 
         if (!$booking) {
@@ -1807,13 +2469,13 @@ private function transformAcceptedBooking($booking)
         }
 
         $request->validate([
-        'status' => 'required|in:on_the_way,work_started,completed'
+        'status' => 'required|in:on_the_way,work_started,work_in_progress,completed'
         ]);
 
     $booking = Booking::with(['customer', 'technician', 'serviceCategory', 'district'])
         ->where('id', $bookingId)
             ->where('technician_id', $technician->id)
-        ->whereIn('status', ['accepted', 'on_the_way', 'work_started'])
+        ->whereIn('status', ['accepted', 'on_the_way', 'work_started', 'work_in_progress'])
             ->first();
 
         if (!$booking) {
@@ -1821,7 +2483,7 @@ private function transformAcceptedBooking($booking)
         }
 
     // Prevent going back to previous status
-    $statusFlow = ['pending', 'accepted', 'on_the_way', 'work_started', 'completed'];
+    $statusFlow = ['pending', 'accepted', 'on_the_way', 'work_started', 'work_in_progress', 'completed'];
     $currentIndex = array_search($booking->status, $statusFlow);
     $newIndex = array_search($request->status, $statusFlow);
     
@@ -1838,6 +2500,8 @@ private function transformAcceptedBooking($booking)
             $updateData['on_the_way_at'] = now();
         } elseif ($request->status == 'work_started') {
             $updateData['work_started_at'] = now();
+        } elseif ($request->status == 'work_in_progress') {
+            $updateData['work_in_progress_at'] = now();
     } elseif ($request->status == 'completed') {
         $result = $this->requestCompletionOtp($booking, $technician);
 
@@ -1892,7 +2556,7 @@ private function transformAcceptedBooking($booking)
             ], 404);
         }
 
-        if ($booking->status === 'pending' && $booking->expires_at && Carbon::now()->greaterThan($booking->expires_at)) {
+        if (!$booking->isBroadcast() && $booking->status === 'pending' && $booking->expires_at && Carbon::now()->greaterThan($booking->expires_at)) {
             $booking->update(['status' => 'expired']);
             $booking->refresh();
         }
@@ -1924,7 +2588,7 @@ private function transformAcceptedBooking($booking)
                 'status' => 'Done',
                 'time' => $booking->created_at ? $booking->created_at->format('h:i A') : null,
                 'description' => null,
-                'is_active' => in_array($booking->status, ['pending', 'accepted', 'on_the_way', 'work_started', 'completed'], true),
+                'is_active' => in_array($booking->status, ['pending', 'accepted', 'on_the_way', 'work_started', 'work_in_progress', 'completed'], true),
                 'is_current' => $booking->status === 'pending',
             ],
             [
@@ -1933,7 +2597,7 @@ private function transformAcceptedBooking($booking)
                 'status' => $booking->accepted_at ? 'Done' : 'Pending',
                 'time' => $booking->accepted_at ? Carbon::parse($booking->accepted_at)->format('h:i A') : null,
                 'description' => $booking->accepted_at ? $technicianName . ' accepted your request' : null,
-                'is_active' => in_array($booking->status, ['accepted', 'on_the_way', 'work_started', 'completed'], true),
+                'is_active' => in_array($booking->status, ['accepted', 'on_the_way', 'work_started', 'work_in_progress', 'completed'], true),
                 'is_current' => $booking->status === 'accepted',
             ],
             [
@@ -1942,7 +2606,7 @@ private function transformAcceptedBooking($booking)
                 'status' => $booking->on_the_way_at ? 'Done' : ($booking->status === 'accepted' ? 'In Progress' : 'Pending'),
                 'time' => $booking->on_the_way_at ? Carbon::parse($booking->on_the_way_at)->format('h:i A') : null,
                 'description' => $booking->status === 'accepted' && !$booking->on_the_way_at ? 'Waiting for technician to start travel' : null,
-                'is_active' => in_array($booking->status, ['on_the_way', 'work_started', 'completed'], true),
+                'is_active' => in_array($booking->status, ['on_the_way', 'work_started', 'work_in_progress', 'completed'], true),
                 'is_current' => $booking->status === 'on_the_way',
             ],
             [
@@ -1951,8 +2615,17 @@ private function transformAcceptedBooking($booking)
                 'status' => $booking->work_started_at ? 'Done' : ($booking->status === 'on_the_way' ? 'In Progress' : 'Pending'),
                 'time' => $booking->work_started_at ? Carbon::parse($booking->work_started_at)->format('h:i A') : null,
                 'description' => $booking->work_started_at ? null : 'Pending technician arrival',
-                'is_active' => in_array($booking->status, ['work_started', 'completed'], true),
+                'is_active' => in_array($booking->status, ['work_started', 'work_in_progress', 'completed'], true),
                 'is_current' => $booking->status === 'work_started',
+            ],
+            [
+                'key' => 'work_in_progress',
+                'title' => 'Work In Progress',
+                'status' => $booking->work_in_progress_at || $booking->status === 'work_in_progress' ? 'Done' : ($booking->status === 'work_started' ? 'In Progress' : 'Pending'),
+                'time' => $booking->work_in_progress_at ? Carbon::parse($booking->work_in_progress_at)->format('h:i A') : null,
+                'description' => $booking->status === 'work_started' && !$booking->work_in_progress_at ? 'Technician is on site' : null,
+                'is_active' => in_array($booking->status, ['work_in_progress', 'completed'], true),
+                'is_current' => $booking->status === 'work_in_progress',
             ],
             [
                 'key' => 'completed',
@@ -1997,7 +2670,7 @@ private function transformAcceptedBooking($booking)
             return response()->json(['error' => 'Booking not found'], 404);
         }
 
-        if ($booking->status === 'pending' && $booking->expires_at && Carbon::now()->greaterThan($booking->expires_at)) {
+        if (!$booking->isBroadcast() && $booking->status === 'pending' && $booking->expires_at && Carbon::now()->greaterThan($booking->expires_at)) {
             $booking->update(['status' => 'expired']);
             $booking->refresh();
         }
@@ -2211,6 +2884,10 @@ private function transformAcceptedBooking($booking)
             'message' => 'Completion OTP sent to customer email.',
             'email_sent' => true,
             'otp_sent' => true,
+            'otp_required' => true,
+            'booking_id' => $booking->id,
+            'verify_endpoint' => '/api/bookings/' . $booking->id . '/verify-completion-otp',
+            'expires_in_minutes' => 30,
         ];
     }
 
@@ -2239,6 +2916,6 @@ private function transformAcceptedBooking($booking)
                 . '<p style="font-size:13px;color:#999;">This code expires in 30 minutes.</p>';
         }
 
-        $this->sendMail($email, $subject, $message);
+        $this->sendMail($email, $subject, $message, [], true);
     }
 }

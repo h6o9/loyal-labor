@@ -136,6 +136,8 @@ Route::prefix('staff')->name('staff.')->middleware([StaffAuthMiddleware::class, 
             ->name('shop-categories.destroy');
 
         Route::resource('users', \App\Http\Controllers\Admin\UserController::class);
+        Route::post('users/change-status/{id}', [\App\Http\Controllers\Admin\UserController::class, 'changeStatus'])
+            ->name('users.change-status');
         Route::post('users/{user}/verify-document', [\App\Http\Controllers\Admin\UserController::class, 'verifyDocument'])
             ->name('users.verify-document');
         Route::post('users/{user}/verify-payment', [\App\Http\Controllers\Admin\UserController::class, 'verifyPayment'])

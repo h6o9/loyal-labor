@@ -52,6 +52,8 @@ Route::get('/technicians/{technicianId}/reviews', [\App\Http\Controllers\Api\Rev
 Route::get('/skills', [TechnicianController::class, 'getSkills']);
 Route::get('/subscriptions', [TechnicianController::class, 'getSubscriptions']);
 Route::get('/get-service-category', [TechnicianController::class, 'getServiceCategory']);
+Route::match(['get', 'post'], '/service-categories/search', [TechnicianController::class, 'searchServiceCategories']);
+Route::match(['get', 'post'], '/search-service-category', [TechnicianController::class, 'searchServiceCategories']);
 Route::get('/bookings/expiry-settings', [BookingController::class, 'getExpirySettings']);
 Route::post('/register-resend-otp', [AuthController::class, 'registerresendOtp']);
 
@@ -85,15 +87,24 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::delete('/technician/work-gallery/{galleryId}', [TechnicianController::class, 'deleteWorkGallery']);
     Route::match(['get', 'post'], '/technician/active-jobs', [BookingController::class, 'activeJobs']);
     Route::match(['get', 'post'], '/technician/pending-requests', [BookingController::class, 'pendingRequests']);
+    Route::match(['get', 'post'], '/technician/booking-requests', [BookingController::class, 'pendingRequests']);
+    Route::match(['get', 'post'], '/technician/booking-history', [BookingController::class, 'technicianBookingHistory']);
 
     // Bookings
     Route::post('/bookings/broadcast', [BookingController::class, 'broadcastRequest']);
     Route::get('/bookings/{bookingId}/broadcast-status', [BookingController::class, 'getBroadcastStatus']);
+    Route::post('/bookings/{bookingId}/expand-radius', [BookingController::class, 'expandBroadcastRadius']);
+    Route::post('/bookings/{bookingId}/select-technician', [BookingController::class, 'selectBroadcastTechnician']);
+    Route::post('/bookings/{bookingId}/approve-technician', [BookingController::class, 'approveBroadcastTechnician']);
+    Route::post('/bookings/{bookingId}/decline-technician', [BookingController::class, 'declineBroadcastTechnician']);
     Route::post('/bookings', [BookingController::class, 'bookTechnician']);
     Route::get('/bookings/my', [BookingController::class, 'myBookings']);
+    Route::match(['get', 'post'], '/bookings/history', [BookingController::class, 'technicianBookingHistory']);
     Route::get('/bookings/requests', [BookingController::class, 'getBookingRequests']);
     Route::match(['get', 'post'], '/bookings/active-jobs', [BookingController::class, 'activeJobs']);
     Route::match(['get', 'post'], '/bookings/pending-requests', [BookingController::class, 'pendingRequests']);
+    Route::match(['get', 'post'], '/bookings/booking-requests', [BookingController::class, 'pendingRequests']);
+    Route::match(['get', 'post'], '/booking-requests', [BookingController::class, 'pendingRequests']);
     Route::get('/bookings/{bookingId}/confirmation', [BookingController::class, 'getBookingConfirmation']);
     Route::get('/bookings/{bookingId}/status', [BookingController::class, 'getBookingStatus']);
     Route::get('/bookings/{bookingId}', [BookingController::class, 'getBookingDetails']);

@@ -61,6 +61,7 @@ class EmailSettingController extends Controller
         Setting::where('key', 'mail_encryption')->update(['value' => $request->mail_encryption]);
 
         Cache::forget('setting');
+        Cache::forget('corn_working');
 
         $notification = __('Update Successfully');
         $notification = ['message' => $notification, 'alert-type' => 'success'];
@@ -139,7 +140,7 @@ class EmailSettingController extends Controller
     public function test_mail_credentials()
     {
         try {
-            $this->sendMail('example@gmail.com', 'Test Email', 'This is a test email');
+            $this->sendMail('example@gmail.com', 'Test Email', 'This is a test email', [], true);
             $notification = __('Mail Sent Successfully');
             $notification = ['message' => $notification, 'alert-type' => 'success'];
 
